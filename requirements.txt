@@ -28,7 +28,6 @@ google-auth==2.38.0
 pyasn1-modules==0.4.1
 apscheduler==3.11.0
 httptools==0.6.4
-uvloop==0.21.0
 watchfiles==1.0.5
 websockets==15.0.1
 python-multipart==0.0.20

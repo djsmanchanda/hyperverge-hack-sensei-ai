@@ -7,6 +7,7 @@ from api.db.task import (
     delete_tasks as delete_tasks_in_db,
     create_draft_task_for_course as create_draft_task_for_course_in_db,
     update_learning_material_task as update_learning_material_task_in_db,
+    # update_conversational_feedback_task as update_conversational_feedback_task_in_db,  # TODO: Need to implement this function
     update_draft_quiz as update_draft_quiz_in_db,
     update_published_quiz as update_published_quiz_in_db,
     mark_task_completed as mark_task_completed_in_db,
@@ -24,6 +25,8 @@ from api.models import (
     CreateDraftTaskResponse,
     PublishLearningMaterialTaskRequest,
     UpdateLearningMaterialTaskRequest,
+    # PublishConversationalFeedbackTaskRequest,  # TODO: Need to implement this model
+    # UpdateConversationalFeedbackTaskRequest,   # TODO: Need to implement this model
     UpdatePublishedQuizRequest,
     DuplicateTaskRequest,
     DuplicateTaskResponse,
@@ -87,6 +90,45 @@ async def update_learning_material_task(
     if not result:
         raise HTTPException(status_code=404, detail="Task not found")
     return result
+
+
+# TODO: Implement conversational feedback functionality
+# These routes are commented out until the missing models and database functions are implemented
+
+# @router.put("/{task_id}/conversational_feedback")
+# async def publish_conversational_feedback_task(
+#     task_id: int, request: PublishConversationalFeedbackTaskRequest
+# ) -> dict:
+#     # Implementation for publishing conversational feedback task
+#     result = await update_conversational_feedback_task_in_db(
+#         task_id,
+#         request.title,
+#         request.recordings,
+#         request.rubric,
+#         request.scheduled_publish_at,
+#         "published",
+#     )
+#     if not result:
+#         raise HTTPException(status_code=404, detail="Task not found")
+#     return {"status": "success"}
+
+
+# @router.post("/{task_id}/conversational_feedback")
+# async def update_conversational_feedback_task(
+#     task_id: int, request: UpdateConversationalFeedbackTaskRequest
+# ) -> dict:
+#     # Implementation for updating conversational feedback task
+#     result = await update_conversational_feedback_task_in_db(
+#         task_id,
+#         request.title,
+#         request.recordings,
+#         request.rubric,
+#         request.scheduled_publish_at,
+#         request.status,
+#     )
+#     if not result:
+#         raise HTTPException(status_code=404, detail="Task not found")
+#     return {"status": "success"}
 
 
 @router.post("/{task_id}/quiz", response_model=QuizTask)

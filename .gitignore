@@ -26,3 +26,8 @@ coverage.xml
 uploads
 db.sqlite
 evals
+*.pkl
+*.json
+*.csv
+hyprerverge-hack-sensei-frontend/node_modules
+hyprerverge-hack-sensei-ai/venv

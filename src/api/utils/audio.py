@@ -1,5 +1,511 @@
 import base64
+import tempfile
+import os
+from typing import Dict, List
+import re
+import json
+from openai import OpenAI
 
 
 def prepare_audio_input_for_ai(audio_data: bytes):
     return base64.b64encode(audio_data).decode("utf-8")
+
+
+class AudioTranscriptionService:
+    def __init__(self):
+        self.client = None
+        try:
+            from api.settings import settings
+
+            self.client = OpenAI(api_key=settings.openai_api_key)
+            print("✅ OpenAI transcription client initialized successfully")
+        except ImportError as e:
+            print(f"❌ OpenAI not available: {e}")
+        except Exception as e:
+            print(f"❌ Error initializing OpenAI client: {e}")
+
+    def transcribe_with_analysis(self, audio_data: bytes) -> Dict:
+        """Transcribe audio using OpenAI API and analyze speech patterns"""
+        if not self.client:
+            return {"error": "OpenAI client not available"}
+
+        # Save audio data to temporary file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_file.write(audio_data)
+            temp_file_path = temp_file.name
+
+        try:
+            # Transcribe using OpenAI API
+            with open(temp_file_path, "rb") as audio_file:
+                transcription = self.client.audio.transcriptions.create(
+                    model="whisper-1",  # Use whisper-1 instead of gpt-4o-transcribe for now
+                    file=audio_file,
+                    response_format="verbose_json",  # Get timestamps
+                    timestamp_granularities=["word"],  # Word-level timestamps
+                )
+
+            # Convert OpenAI response to our expected format
+            result = {
+                "text": transcription.text,
+                "segments": getattr(transcription, "segments", []),
+                "words": getattr(transcription, "words", []),
+            }
+
+            # Analyze speech patterns
+            analysis = self._analyze_speech_patterns(result)
+
+            return {
+                "transcript": result["text"],
+                "segments": result.get("segments", []),
+                "analysis": analysis,
+                "duration": self._get_total_duration(result),
+            }
+
+        except Exception as e:
+            print(f"Error during transcription: {e}")
+            return {"error": str(e)}
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+
+    def _get_total_duration(self, result: Dict) -> float:
+        """Extract total duration from transcription result"""
+        if result.get("segments"):
+            return result["segments"][-1].get("end", 0)
+        elif result.get("words"):
+            return self._get_word_property(result["words"][-1], "end", 0)
+        return 0
+
+    def _get_word_property(self, word_obj, property_name: str, default=None):
+        """Safely get property from word object (handles both dict and object formats)"""
+        if hasattr(word_obj, property_name):
+            return getattr(word_obj, property_name, default)
+        elif isinstance(word_obj, dict):
+            return word_obj.get(property_name, default)
+        return default
+
+    def _analyze_speech_patterns(self, transcription_result: Dict) -> Dict:
+        """Analyze speech patterns for feedback"""
+        segments = transcription_result.get("segments", [])
+        words = transcription_result.get("words", [])
+        text = transcription_result.get("text", "")
+
+        # If no word-level timestamps, extract from segments
+        if not words and segments:
+            words = []
+            for segment in segments:
+                if "words" in segment and segment["words"]:
+                    words.extend(segment["words"])
+                else:
+                    # Fallback: create word entries from segment
+                    segment_words = segment.get("text", "").split()
+                    segment_duration = segment.get("end", 0) - segment.get("start", 0)
+                    word_duration = segment_duration / len(segment_words) if segment_words else 0
+
+                    for i, word in enumerate(segment_words):
+                        words.append(
+                            {
+                                "word": word,
+                                "start": segment.get("start", 0) + (i * word_duration),
+                                "end": segment.get("start", 0) + ((i + 1) * word_duration),
+                            }
+                        )
+
+        # Enhanced filler word detection with more comprehensive patterns
+        filler_patterns = [
+            r"\b(um|uh|er|ah|hmm|mmm|uhm)\b",  # Basic hesitation sounds
+            r"\b(like|you know|basically|actually|literally|obviously|clearly)\b",  # Discourse markers
+            r"\b(so|well|right|okay|now|then|anyway|however)\b(?=\s)",  # Transition fillers
+            r"\b(I mean|sort of|kind of|you see|you understand|if you will)\b",  # Phrase fillers
+            r"\b(and stuff|or whatever|or something|et cetera|etc)\b",  # Vague endings
+        ]
+
+        fillers = []
+        filler_count = 0
+        filler_density_segments = []  # Track filler density per segment
+
+        for word_info in words:
+            word = self._get_word_property(word_info, "word", "").lower().strip()
+            for pattern in filler_patterns:
+                if re.search(pattern, word):
+                    fillers.append(
+                        {
+                            "word": word,
+                            "start": self._get_word_property(word_info, "start", 0),
+                            "end": self._get_word_property(word_info, "end", 0),
+                            "type": self._classify_filler_type(word)
+                        }
+                    )
+                    filler_count += 1
+                    break
+
+        # Calculate speaking rate
+        total_duration = self._get_total_duration(transcription_result)
+        word_count = len(words)
+        wpm = (word_count / total_duration * 60) if total_duration > 0 else 0
+
+        # Detect long pauses
+        long_pauses = []
+        if segments:
+            for i in range(1, len(segments)):
+                gap = segments[i]["start"] - segments[i - 1]["end"]
+                if gap > 2.0:  # Pause longer than 2 seconds
+                    long_pauses.append(
+                        {
+                            "start": segments[i - 1]["end"],
+                            "end": segments[i]["start"],
+                            "duration": gap,
+                        }
+                    )
+
+        # Detect language switching
+        language_analysis = self._detect_language_switching(text, segments)
+        
+        # Analyze coherence and logical flow
+        coherence_analysis = self._analyze_coherence(text, segments)
+        
+        # Detect repetitive content
+        repetition_analysis = self._analyze_repetition(text, words)
+        
+        # Calculate filler word density per segment
+        filler_density = self._calculate_filler_density(fillers, segments)
+
+        return {
+            "word_count": word_count,
+            "filler_count": filler_count,
+            "fillers": fillers,
+            "filler_density": filler_density,
+            "speaking_rate_wpm": wpm,
+            "long_pauses": long_pauses,
+            "total_duration": total_duration,
+            "language_analysis": language_analysis,
+            "coherence_analysis": coherence_analysis,
+            "repetition_analysis": repetition_analysis,
+            "overall_clarity_score": self._calculate_clarity_score(
+                filler_count, word_count, len(long_pauses), coherence_analysis, language_analysis, repetition_analysis
+            )
+        }
+
+    def _classify_filler_type(self, word: str) -> str:
+        """Classify the type of filler word"""
+        hesitation_sounds = ["um", "uh", "er", "ah", "hmm", "mmm", "uhm"]
+        discourse_markers = ["like", "you know", "basically", "actually", "literally", "obviously", "clearly"]
+        transition_fillers = ["so", "well", "right", "okay", "now", "then", "anyway", "however"]
+        phrase_fillers = ["i mean", "sort of", "kind of", "you see", "you understand", "if you will"]
+        vague_endings = ["and stuff", "or whatever", "or something", "et cetera", "etc"]
+        
+        word_lower = word.lower().strip()
+        if word_lower in hesitation_sounds:
+            return "hesitation"
+        elif word_lower in discourse_markers:
+            return "discourse_marker"
+        elif word_lower in transition_fillers:
+            return "transition"
+        elif word_lower in phrase_fillers:
+            return "phrase_filler"
+        elif word_lower in vague_endings:
+            return "vague_ending"
+        else:
+            return "other"
+
+    def _detect_language_switching(self, text: str, segments: List) -> Dict:
+        """Detect if the speaker is switching between languages"""
+        # Common patterns that indicate language switching
+        language_indicators = {
+            'spanish': ['que', 'pero', 'y', 'en', 'el', 'la', 'es', 'no', 'si', 'con', 'un', 'una', 'por', 'para', 'como', 'muy', 'bien', 'más', 'también', 'gracias', 'hola', 'adiós'],
+            'french': ['que', 'le', 'de', 'et', 'à', 'un', 'il', 'être', 'et', 'en', 'avoir', 'que', 'pour', 'dans', 'ce', 'son', 'une', 'sur', 'avec', 'ne', 'se', 'pas', 'tout', 'plus', 'par', 'pouvoir', 'mais', 'oui', 'bonjour', 'merci', 'au revoir'],
+            'german': ['der', 'die', 'und', 'in', 'den', 'von', 'zu', 'das', 'mit', 'sich', 'des', 'auf', 'für', 'ist', 'im', 'dem', 'nicht', 'ein', 'eine', 'als', 'auch', 'es', 'an', 'werden', 'aus', 'er', 'hat', 'dass', 'sie', 'nach', 'wird', 'bei', 'einer', 'um', 'am', 'sind', 'noch', 'wie', 'einem', 'über', 'einen', 'so', 'zum', 'war', 'haben', 'nur', 'oder', 'aber', 'vor', 'zur', 'bis', 'mehr', 'durch', 'man', 'sein', 'wurde', 'sei', 'in', 'hallo', 'danke', 'auf wiedersehen'],
+            'hindi': ['है', 'में', 'की', 'को', 'का', 'के', 'से', 'पर', 'और', 'यह', 'वह', 'एक', 'हमारे', 'तुम', 'आप', 'मैं', 'हम', 'था', 'थी', 'करना', 'होना', 'जाना', 'कहना', 'देना', 'लेना', 'आना', 'जो', 'भी', 'नहीं', 'तो', 'ही', 'अच्छा', 'बुरा', 'नमस्ते', 'धन्यवाद'],
+            'arabic': ['في', 'من', 'إلى', 'على', 'أن', 'هذا', 'هذه', 'التي', 'الذي', 'كان', 'لا', 'ما', 'قد', 'له', 'أو', 'عن', 'كما', 'بعد', 'قبل', 'عند', 'حتى', 'بين', 'تحت', 'فوق', 'أمام', 'خلف', 'يمين', 'يسار', 'السلام عليكم', 'شكرا', 'مع السلامة']
+        }
+        
+        words = text.lower().split()
+        detected_languages = set()
+        language_switches = []
+        
+        # Count words in each language
+        language_counts = {lang: 0 for lang in language_indicators.keys()}
+        
+        for word in words:
+            for lang, indicators in language_indicators.items():
+                if word in indicators:
+                    language_counts[lang] += 1
+                    detected_languages.add(lang)
+        
+        # Detect significant language switching (more than 2 words in a non-English language)
+        significant_languages = [lang for lang, count in language_counts.items() if count >= 2]
+        
+        is_multilingual = len(significant_languages) > 0
+        switching_frequency = len(significant_languages)
+        
+        return {
+            "is_multilingual": is_multilingual,
+            "detected_languages": list(detected_languages),
+            "significant_languages": significant_languages,
+            "language_counts": language_counts,
+            "switching_frequency": switching_frequency,
+            "multilingual_score": min(10, max(1, 10 - switching_frequency * 2))  # 1-10 scale
+        }
+
+    def _analyze_coherence(self, text: str, segments: List) -> Dict:
+        """Analyze logical organization and clarity of ideas"""
+        sentences = re.split(r'[.!?]+', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        # Coherence indicators
+        transition_words = [
+            'first', 'second', 'third', 'finally', 'moreover', 'furthermore', 'however', 
+            'therefore', 'consequently', 'in conclusion', 'to summarize', 'on the other hand',
+            'for example', 'such as', 'in addition', 'meanwhile', 'nevertheless', 'thus',
+            'accordingly', 'similarly', 'likewise', 'in contrast', 'as a result'
+        ]
+        
+        logical_connectors = [
+            'because', 'since', 'although', 'while', 'whereas', 'if', 'unless', 'until',
+            'before', 'after', 'when', 'where', 'why', 'how', 'what', 'which', 'that'
+        ]
+        
+        # Count coherence markers
+        transition_count = 0
+        logical_connector_count = 0
+        
+        words = text.lower().split()
+        for word in words:
+            if word in transition_words:
+                transition_count += 1
+            if word in logical_connectors:
+                logical_connector_count += 1
+        
+        # Analyze sentence structure variety
+        sentence_lengths = [len(s.split()) for s in sentences]
+        avg_sentence_length = sum(sentence_lengths) / len(sentence_lengths) if sentence_lengths else 0
+        sentence_variety = len(set(sentence_lengths)) / len(sentence_lengths) if sentence_lengths else 0
+        
+        # Check for abrupt topic changes (simple heuristic)
+        topic_consistency = self._analyze_topic_consistency(sentences)
+        
+        # Calculate coherence score (1-10)
+        coherence_factors = [
+            min(10, transition_count * 2),  # Transition words boost score
+            min(10, logical_connector_count),  # Logical connectors boost score
+            min(10, max(1, avg_sentence_length / 2)),  # Reasonable sentence length
+            min(10, sentence_variety * 10),  # Sentence variety
+            topic_consistency * 10  # Topic consistency
+        ]
+        
+        coherence_score = sum(coherence_factors) / len(coherence_factors)
+        
+        return {
+            "coherence_score": round(min(10, max(1, coherence_score)), 1),
+            "transition_words_count": transition_count,
+            "logical_connectors_count": logical_connector_count,
+            "average_sentence_length": round(avg_sentence_length, 1),
+            "sentence_count": len(sentences),
+            "sentence_variety_score": round(sentence_variety, 2),
+            "topic_consistency_score": round(topic_consistency, 2),
+            "coherence_issues": self._identify_coherence_issues(sentences, transition_count, logical_connector_count)
+        }
+
+    def _analyze_topic_consistency(self, sentences: List[str]) -> float:
+        """Analyze how consistent the topic is throughout the speech"""
+        if len(sentences) < 2:
+            return 1.0
+        
+        # Simple keyword overlap between consecutive sentences
+        consistency_scores = []
+        
+        for i in range(len(sentences) - 1):
+            words1 = set(sentences[i].lower().split())
+            words2 = set(sentences[i + 1].lower().split())
+            
+            # Remove common stop words for better analysis
+            stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them', 'my', 'your', 'his', 'her', 'its', 'our', 'their', 'this', 'that', 'these', 'those'}
+            
+            words1 = words1 - stop_words
+            words2 = words2 - stop_words
+            
+            if len(words1) == 0 or len(words2) == 0:
+                consistency_scores.append(0.5)
+            else:
+                overlap = len(words1.intersection(words2))
+                union = len(words1.union(words2))
+                consistency_scores.append(overlap / union if union > 0 else 0)
+        
+        return sum(consistency_scores) / len(consistency_scores) if consistency_scores else 1.0
+
+    def _identify_coherence_issues(self, sentences: List[str], transition_count: int, logical_connector_count: int) -> List[str]:
+        """Identify specific coherence issues"""
+        issues = []
+        
+        if len(sentences) > 3 and transition_count == 0:
+            issues.append("Lacks transition words to connect ideas")
+        
+        if len(sentences) > 2 and logical_connector_count == 0:
+            issues.append("Missing logical connectors to show relationships between ideas")
+        
+        sentence_lengths = [len(s.split()) for s in sentences]
+        if sentence_lengths:
+            avg_length = sum(sentence_lengths) / len(sentence_lengths)
+            if avg_length < 3:
+                issues.append("Sentences are too short and choppy")
+            elif avg_length > 30:
+                issues.append("Sentences are too long and complex")
+        
+        if len(set(sentence_lengths)) == 1 and len(sentences) > 2:
+            issues.append("All sentences have similar length - add variety")
+        
+        return issues
+
+    def _analyze_repetition(self, text: str, words: List) -> Dict:
+        """Analyze repetitive content and redundancy"""
+        word_list = [self._get_word_property(w, "word", "").lower().strip() for w in words if self._get_word_property(w, "word")]
+        
+        # Remove common stop words for meaningful repetition analysis
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can'}
+        
+        meaningful_words = [w for w in word_list if w not in stop_words and len(w) > 2]
+        
+        # Count word frequencies
+        word_freq = {}
+        for word in meaningful_words:
+            word_freq[word] = word_freq.get(word, 0) + 1
+        
+        # Find repetitive words (appearing more than expected)
+        total_meaningful_words = len(meaningful_words)
+        repetitive_words = []
+        excessive_repetitions = []
+        
+        for word, count in word_freq.items():
+            expected_frequency = 1 / len(set(meaningful_words)) if meaningful_words else 0
+            actual_frequency = count / total_meaningful_words if total_meaningful_words > 0 else 0
+            
+            if count > 2 and actual_frequency > expected_frequency * 3:  # More than 3x expected
+                repetitive_words.append({"word": word, "count": count, "frequency": actual_frequency})
+            
+            if count > 5:  # Excessive repetition
+                excessive_repetitions.append({"word": word, "count": count})
+        
+        # Analyze phrase repetition
+        phrases = self._extract_phrases(text)
+        repeated_phrases = self._find_repeated_phrases(phrases)
+        
+        # Calculate repetition score (1-10, where 10 is no repetition)
+        repetition_penalty = len(repetitive_words) + len(excessive_repetitions) * 2 + len(repeated_phrases) * 3
+        repetition_score = max(1, 10 - repetition_penalty)
+        
+        return {
+            "repetition_score": repetition_score,
+            "repetitive_words": repetitive_words,
+            "excessive_repetitions": excessive_repetitions,
+            "repeated_phrases": repeated_phrases,
+            "unique_word_ratio": len(set(meaningful_words)) / len(meaningful_words) if meaningful_words else 1.0,
+            "repetition_issues": self._identify_repetition_issues(repetitive_words, excessive_repetitions, repeated_phrases)
+        }
+
+    def _extract_phrases(self, text: str) -> List[str]:
+        """Extract 2-4 word phrases from text"""
+        words = text.lower().split()
+        phrases = []
+        
+        for length in [2, 3, 4]:
+            for i in range(len(words) - length + 1):
+                phrase = " ".join(words[i:i+length])
+                phrases.append(phrase)
+        
+        return phrases
+
+    def _find_repeated_phrases(self, phrases: List[str]) -> List[Dict]:
+        """Find phrases that are repeated"""
+        phrase_freq = {}
+        for phrase in phrases:
+            phrase_freq[phrase] = phrase_freq.get(phrase, 0) + 1
+        
+        repeated = []
+        for phrase, count in phrase_freq.items():
+            if count > 1 and len(phrase.split()) >= 2:  # At least 2 words, repeated
+                repeated.append({"phrase": phrase, "count": count})
+        
+        return sorted(repeated, key=lambda x: x["count"], reverse=True)[:5]  # Top 5
+
+    def _identify_repetition_issues(self, repetitive_words: List, excessive_repetitions: List, repeated_phrases: List) -> List[str]:
+        """Identify specific repetition issues"""
+        issues = []
+        
+        if excessive_repetitions:
+            most_repeated = max(excessive_repetitions, key=lambda x: x["count"])
+            issues.append(f"Excessive repetition of '{most_repeated['word']}' ({most_repeated['count']} times)")
+        
+        if len(repetitive_words) > 3:
+            issues.append(f"Too many repetitive words ({len(repetitive_words)} different words overused)")
+        
+        if repeated_phrases:
+            issues.append(f"Repeated phrases detected: '{repeated_phrases[0]['phrase']}' used {repeated_phrases[0]['count']} times")
+        
+        if len(issues) == 0 and (repetitive_words or repeated_phrases):
+            issues.append("Some word/phrase repetition detected - consider using synonyms")
+        
+        return issues
+
+    def _calculate_filler_density(self, fillers: List, segments: List) -> Dict:
+        """Calculate filler word density per segment"""
+        if not segments:
+            return {"overall_density": 0, "segment_densities": []}
+        
+        segment_densities = []
+        for segment in segments:
+            segment_start = segment.get("start", 0)
+            segment_end = segment.get("end", 0)
+            segment_text = segment.get("text", "")
+            segment_words = len(segment_text.split())
+            
+            # Count fillers in this segment
+            segment_fillers = [f for f in fillers if segment_start <= f["start"] <= segment_end]
+            density = len(segment_fillers) / segment_words if segment_words > 0 else 0
+            
+            segment_densities.append({
+                "start": segment_start,
+                "end": segment_end,
+                "filler_count": len(segment_fillers),
+                "word_count": segment_words,
+                "density": density
+            })
+        
+        overall_density = len(fillers) / sum(s["word_count"] for s in segment_densities) if segment_densities else 0
+        
+        return {
+            "overall_density": overall_density,
+            "segment_densities": segment_densities,
+            "high_density_segments": [s for s in segment_densities if s["density"] > 0.2]  # More than 20% fillers
+        }
+
+    def _calculate_clarity_score(self, filler_count: int, word_count: int, long_pause_count: int, 
+                               coherence_analysis: Dict, language_analysis: Dict, repetition_analysis: Dict) -> float:
+        """Calculate overall clarity score from 1-10"""
+        
+        # Filler score (1-10, where fewer fillers = higher score)
+        filler_ratio = filler_count / word_count if word_count > 0 else 0
+        filler_score = max(1, 10 - (filler_ratio * 30))  # Penalty for high filler ratio
+        
+        # Pause score (1-10, where fewer long pauses = higher score)
+        pause_score = max(1, 10 - long_pause_count)
+        
+        # Get scores from other analyses
+        coherence_score = coherence_analysis.get("coherence_score", 5)
+        multilingual_score = language_analysis.get("multilingual_score", 10)
+        repetition_score = repetition_analysis.get("repetition_score", 10)
+        
+        # Weight the different factors
+        weighted_score = (
+            filler_score * 0.25 +      # 25% weight on filler words
+            pause_score * 0.15 +       # 15% weight on pauses
+            coherence_score * 0.30 +   # 30% weight on coherence
+            multilingual_score * 0.15 + # 15% weight on language consistency
+            repetition_score * 0.15    # 15% weight on avoiding repetition
+        )
+        
+        return round(min(10, max(1, weighted_score)), 1)
+
+
+# Global instance
+audio_service = AudioTranscriptionService()

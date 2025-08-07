@@ -318,6 +318,19 @@ class DraftQuestion(BaseModel):
     title: str
 
 
+class DraftQuestionRequest(BaseModel):
+    # Permissive version for request validation during previews/test mode
+    blocks: List[Block]
+    answer: List[Block] | None = None
+    type: QuestionType
+    input_type: TaskInputType
+    response_type: TaskAIResponseType
+    context: Dict | None = None
+    coding_languages: List[str] | None = None
+    scorecard_id: Optional[int] = None
+    title: Optional[str] = None
+
+
 class PublishedQuestion(DraftQuestion):
     id: int
     scorecard_id: Optional[int] = None
@@ -642,13 +655,14 @@ class UserCohort(BaseModel):
 
 class AIChatRequest(BaseModel):
     user_response: str
-    task_type: TaskType
-    question: Optional[DraftQuestion] = None
+    task_type: str  # accept 'quiz' | 'learning_material'
+    question: Optional[DraftQuestionRequest] = None
     chat_history: Optional[List[Dict]] = None
-    question_id: Optional[int] = None
-    user_id: int
-    task_id: int
-    response_type: Optional[ChatResponseType] = None
+    # Accept both string or int to handle preview/test flows and DB IDs
+    question_id: Optional[int | str] = None
+    user_id: Optional[int | str] = None
+    task_id: Optional[int | str] = None
+    response_type: Optional[str] = None  # 'text' | 'code' | 'audio'
 
 
 class MarkTaskCompletedRequest(BaseModel):
