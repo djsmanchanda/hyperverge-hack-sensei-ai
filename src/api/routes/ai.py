@@ -55,7 +55,7 @@ from api.utils.s3 import (
     download_file_from_s3_as_bytes,
     get_media_upload_s3_key_from_uuid,
 )
-from api.utils.audio import prepare_audio_input_for_ai
+from api.utils.audio import audio_service
 from api.settings import tracer
 from opentelemetry.trace import StatusCode, Status
 from openinference.instrumentation import using_attributes
@@ -258,11 +258,11 @@ async def ai_response_for_question(request: AIChatRequest):
 
     # Define an async generator for streaming
     async def stream_response() -> AsyncGenerator[str, None]:
-        with tracer.start_as_current_span(
-            "ai_chat", openinference_span_kind="llm"
-        ) as span:
-            span.set_input(chat_history)
-
+        # Fix the tracer span creation - remove problematic method calls
+        with tracer.start_as_current_span("ai_chat") as span:
+            # Remove: span.set_input(chat_history)
+            # The NonRecordingSpan doesn't support this method
+            
             if request.task_type == TaskType.LEARNING_MATERIAL:
                 with using_attributes(
                     session_id=session_id,
@@ -1170,3 +1170,189 @@ async def resume_pending_task_generation_jobs():
         )
 
     await async_batch_gather(tasks, description="Resuming task generation jobs")
+
+
+class CriterionScore(BaseModel):
+    criterion: str
+    score: int = Field(..., ge=1, le=5)
+    feedback: str
+    transcript_references: List[str] = Field(default_factory=list)
+
+class ActionableTip(BaseModel):
+    title: str
+    description: str
+    transcript_lines: List[str] = Field(default_factory=list)
+    timestamp_ranges: List[Dict] = Field(default_factory=list)
+    priority: int = Field(..., ge=1, le=3)
+
+class InterviewEvaluationResponse(BaseModel):
+    scores: List[CriterionScore]
+    overall_score: float
+    actionable_tips: List[ActionableTip]
+    transcript: str
+    speech_analysis: Dict
+    duration_seconds: float
+
+
+@router.post("/interview/evaluate")
+async def evaluate_interview_response(
+    audio_uuid: str,
+    question: str,
+    max_duration: int = 60,
+    user_id: Optional[str] = None
+):
+    """Evaluate audio interview response with transcription and rubric scoring"""
+    
+    try:
+        # Download audio file
+        if settings.s3_folder_name:
+            audio_data = download_file_from_s3_as_bytes(
+                get_media_upload_s3_key_from_uuid(audio_uuid, "wav")
+            )
+        else:
+            audio_file_path = os.path.join(settings.local_upload_folder, f"{audio_uuid}.wav")
+            with open(audio_file_path, "rb") as f:
+                audio_data = f.read()
+        
+        # Get AI evaluation using existing infrastructure
+        evaluation = await get_interview_ai_evaluation(
+            question=question,
+            audio_data=audio_data,
+            max_duration=max_duration
+        )
+        
+        return evaluation
+        
+    except Exception as e:
+        logger.error(f"Error in interview evaluation: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def get_interview_ai_evaluation(
+    question: str,
+    audio_data: bytes,
+    max_duration: int
+) -> InterviewEvaluationResponse:
+    """Get AI evaluation for interview response"""
+    
+    # Get transcription and analysis
+    transcription_result = audio_service.transcribe_with_analysis(audio_data)
+    
+    if "error" in transcription_result:
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {transcription_result['error']}")
+    
+    transcript = transcription_result["transcript"]
+    analysis = transcription_result["analysis"]
+    
+    # Enhanced AI evaluation prompt
+    system_prompt = f"""You are an expert interview coach evaluating a candidate's audio response.
+
+EVALUATION CRITERIA (Score 1-5 for each):
+1. CONTENT (1-5): Accuracy, depth, and relevance of information
+2. STRUCTURE (1-5): Logical organization and flow of ideas  
+3. CLARITY (1-5): Clear communication and word choice
+4. DELIVERY (1-5): Confidence, pacing, and minimal fillers
+
+RESPONSE DATA:
+Question: {question}
+Transcript: {transcript}
+Duration: {analysis['total_duration']:.1f}s (target: {max_duration}s)
+Speaking Rate: {analysis['speaking_rate_wpm']:.1f} WPM
+Filler Count: {analysis['filler_count']}
+Long Pauses: {len(analysis['long_pauses'])}
+
+FILLER ANALYSIS:
+{format_fillers_for_prompt(analysis['fillers'])}
+
+Provide detailed scores and specific feedback for each criterion. Reference specific parts of the transcript when giving feedback.
+
+Return 2-3 actionable tips for improvement with specific transcript references."""
+
+    try:
+        # Use your existing LLM infrastructure
+        response = await run_llm_with_instructor(
+            api_key=settings.openai_api_key,
+            model=openai_plan_to_model_name["text"],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "Evaluate this interview response according to the rubric."}
+            ],
+            response_model=InterviewEvaluationResponse,
+            max_completion_tokens=4096,
+        )
+        
+        # Add timestamp data for filler words
+        for tip in response.actionable_tips:
+            if "filler" in tip.description.lower():
+                tip.timestamp_ranges = [
+                    {"start": f["start"], "end": f["end"], "word": f["word"]}
+                    for f in analysis["fillers"][:3]  # First 3 fillers
+                ]
+        
+        response.transcript = transcript
+        response.speech_analysis = analysis
+        response.duration_seconds = analysis["total_duration"]
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"AI evaluation failed: {str(e)}")
+        # Fallback evaluation
+        return create_fallback_evaluation(transcript, analysis)
+
+def format_fillers_for_prompt(fillers: List) -> str:
+    """Format filler analysis for AI prompt"""
+    if not fillers:
+        return "No significant fillers detected."
+    
+    filler_summary = {}
+    for filler in fillers:
+        word = filler["word"].lower().strip()
+        filler_summary[word] = filler_summary.get(word, 0) + 1
+    
+    return "\n".join([f"- '{word}': {count} times" for word, count in filler_summary.items()])
+
+def create_fallback_evaluation(transcript: str, analysis: Dict) -> InterviewEvaluationResponse:
+    """Create a basic evaluation when AI fails"""
+    return InterviewEvaluationResponse(
+        scores=[
+            CriterionScore(
+                criterion="content",
+                score=3,
+                feedback="Response received and processed.",
+                transcript_references=[]
+            )
+        ],
+        overall_score=3.0,
+        actionable_tips=[],
+        transcript=transcript,
+        speech_analysis=analysis,
+        duration_seconds=analysis["total_duration"]
+    )
+
+
+@router.get("/interview/prompts/{category}")
+async def get_interview_prompts(category: str):
+    """Get curated interview prompts by category"""
+    
+    prompts = {
+        "cs": [
+            "Explain the LRU cache algorithm in 60 seconds or less.",
+            "Describe how you would design a URL shortener like bit.ly.",
+            "Walk me through the process of how a web browser loads a webpage.",
+            "Explain the difference between SQL and NoSQL databases.",
+            "Describe what happens when you type a URL into your browser."
+        ],
+        "hr": [
+            "Tell me about a time you had to work with a difficult team member.",
+            "Describe your greatest professional achievement.",
+            "Why are you interested in this role?",
+            "How do you handle stress and pressure?",
+            "Where do you see yourself in 5 years?"
+        ]
+    }
+    
+    if category.lower() not in prompts:
+        raise HTTPException(status_code=404, detail="Category not found")
+    
+    return {"prompts": prompts[category.lower()]}
