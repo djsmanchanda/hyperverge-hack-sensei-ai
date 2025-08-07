@@ -7,6 +7,7 @@ from api.db.task import (
     delete_tasks as delete_tasks_in_db,
     create_draft_task_for_course as create_draft_task_for_course_in_db,
     update_learning_material_task as update_learning_material_task_in_db,
+    update_conversational_feedback_task as update_conversational_feedback_task_in_db,
     update_draft_quiz as update_draft_quiz_in_db,
     update_published_quiz as update_published_quiz_in_db,
     mark_task_completed as mark_task_completed_in_db,
@@ -17,6 +18,7 @@ from api.models import (
     Task,
     LearningMaterialTask,
     QuizTask,
+    ConversationalFeedbackTask,
     LeaderboardViewType,
     UpdateDraftQuizRequest,
     CreateDraftTaskRequest,
@@ -24,6 +26,8 @@ from api.models import (
     CreateDraftTaskResponse,
     PublishLearningMaterialTaskRequest,
     UpdateLearningMaterialTaskRequest,
+    PublishConversationalFeedbackTaskRequest,
+    UpdateConversationalFeedbackTaskRequest,
     UpdatePublishedQuizRequest,
     DuplicateTaskRequest,
     DuplicateTaskResponse,
@@ -83,6 +87,40 @@ async def update_learning_material_task(
         request.blocks,
         request.scheduled_publish_at,
         request.status,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return result
+
+
+@router.put("/{task_id}/conversational_feedback", response_model=ConversationalFeedbackTask)
+async def publish_conversational_feedback_task(
+    task_id: int, request: PublishConversationalFeedbackTaskRequest
+) -> ConversationalFeedbackTask:
+    result = await update_conversational_feedback_task_in_db(
+        task_id,
+        request.title,
+        request.config.model_dump(),
+        request.scheduled_publish_at,
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return result
+
+
+@router.post("/{task_id}/conversational_feedback", response_model=ConversationalFeedbackTask)
+async def update_conversational_feedback_task(
+    task_id: int, request: UpdateConversationalFeedbackTaskRequest
+) -> ConversationalFeedbackTask:
+    from api.models import TaskStatus
+    status = TaskStatus.DRAFT if request.status == "draft" else TaskStatus.PUBLISHED
+    
+    result = await update_conversational_feedback_task_in_db(
+        task_id,
+        request.title,
+        request.config.model_dump(),
+        request.scheduled_publish_at,
+        status,
     )
     if not result:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -154,7 +192,7 @@ async def get_tasks_completed_for_user(
 
 
 @router.get("/{task_id}")
-async def get_task(task_id: int) -> LearningMaterialTask | QuizTask:
+async def get_task(task_id: int) -> LearningMaterialTask | QuizTask | ConversationalFeedbackTask:
     task = await get_task_from_db(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")

@@ -21,6 +21,7 @@ from api.routes import (
     file,
     ai,
     scorecard,
+    conversational_feedback,
 )
 from api.routes.ai import (
     resume_pending_task_generation_jobs,
@@ -107,6 +108,7 @@ app.include_router(file.router, prefix="/file", tags=["file"])
 app.include_router(ai.router, prefix="/ai", tags=["ai"])
 app.include_router(auth.router, prefix="/auth", tags=["auth"])
 app.include_router(task.router, prefix="/tasks", tags=["tasks"])
+app.include_router(conversational_feedback.router, prefix="/conversational-feedback", tags=["conversational-feedback"])
 app.include_router(chat.router, prefix="/chat", tags=["chat"])
 app.include_router(user.router, prefix="/users", tags=["users"])
 app.include_router(org.router, prefix="/organizations", tags=["organizations"])

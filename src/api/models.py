@@ -164,6 +164,7 @@ class Milestone(BaseModel):
 class TaskType(Enum):
     QUIZ = "quiz"
     LEARNING_MATERIAL = "learning_material"
+    CONVERSATIONAL_FEEDBACK = "conversational_feedback"
 
     def __str__(self):
         return self.value
@@ -705,3 +706,62 @@ class SaveCodeDraftRequest(BaseModel):
 class CodeDraft(BaseModel):
     id: int
     code: List[LanguageCodeDraft]
+
+
+# Conversational Feedback Models
+class FeedbackCriterion(BaseModel):
+    name: str
+    description: str
+    maxScore: int
+
+
+class FeedbackRubric(BaseModel):
+    name: str
+    criteria: List[FeedbackCriterion]
+
+
+class ConversationalFeedbackConfig(BaseModel):
+    maxDuration: int  # seconds
+    prompt: List[Dict]  # BlockNote content blocks
+    rubric: FeedbackRubric
+
+
+class UpdateConversationalFeedbackTaskRequest(BaseModel):
+    title: str
+    config: ConversationalFeedbackConfig
+    scheduled_publish_at: Optional[datetime] = None
+    status: str
+
+
+class PublishConversationalFeedbackTaskRequest(BaseModel):
+    title: str
+    config: ConversationalFeedbackConfig
+    scheduled_publish_at: Optional[datetime] = None
+
+
+class ConversationalFeedbackResponse(BaseModel):
+    transcription: str
+    feedback: Dict
+    scores: List[Dict]
+    overall_score: float
+
+
+class ConversationalFeedbackTask(BaseModel):
+    id: int
+    title: str
+    type: str
+    status: str
+    org_id: int
+    config: ConversationalFeedbackConfig
+    scheduled_publish_at: Optional[datetime] = None
+
+
+class ConversationalFeedbackSubmission(BaseModel):
+    id: int
+    user_id: int
+    task_id: int
+    audio_file_uuid: str
+    transcription: Optional[str] = None
+    feedback: Optional[Dict] = None
+    submitted_at: datetime
+    processed_at: Optional[datetime] = None

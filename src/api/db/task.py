@@ -27,6 +27,7 @@ from api.models import (
     TaskStatus,
     ScorecardStatus,
     LearningMaterialTask,
+    ConversationalFeedbackTask,
     LeaderboardViewType,
     GenerateTaskJobStatus,
     TaskAIResponseType,
@@ -228,6 +229,15 @@ async def get_task(task_id: int):
 
         task_data["blocks"] = json.loads(result[0]) if result[0] else []
 
+    elif task_data["type"] == TaskType.CONVERSATIONAL_FEEDBACK:
+        result = await execute_db_operation(
+            f"SELECT blocks FROM {tasks_table_name} WHERE id = ?",
+            (task_id,),
+            fetch_one=True,
+        )
+
+        task_data["config"] = json.loads(result[0]) if result[0] else {}
+
     elif task_data["type"] == TaskType.QUIZ:
         questions = await execute_db_operation(
             f"""
@@ -323,6 +333,36 @@ async def update_learning_material_task(
             f"UPDATE {tasks_table_name} SET blocks = ?, status = ?, title = ?, scheduled_publish_at = ? WHERE id = ?",
             (
                 json.dumps(prepare_blocks_for_publish(blocks)),
+                str(status),
+                title,
+                scheduled_publish_at,
+                task_id,
+            ),
+        )
+
+        await conn.commit()
+
+        return await get_task(task_id)
+
+
+async def update_conversational_feedback_task(
+    task_id: int,
+    title: str,
+    config: Dict,
+    scheduled_publish_at: datetime,
+    status: TaskStatus = TaskStatus.PUBLISHED,
+) -> ConversationalFeedbackTask:
+    if not await does_task_exist(task_id):
+        return False
+
+    # Execute all operations in a single transaction
+    async with get_new_db_connection() as conn:
+        cursor = await conn.cursor()
+
+        await cursor.execute(
+            f"UPDATE {tasks_table_name} SET blocks = ?, status = ?, title = ?, scheduled_publish_at = ? WHERE id = ?",
+            (
+                json.dumps(config),
                 str(status),
                 title,
                 scheduled_publish_at,
@@ -563,6 +603,14 @@ async def duplicate_task(task_id: int, course_id: int, milestone_id: int) -> int
             new_task_id,
             task["title"],
             task["blocks"],
+            None,
+            TaskStatus.DRAFT,
+        )
+    elif task["type"] == TaskType.CONVERSATIONAL_FEEDBACK:
+        await update_conversational_feedback_task(
+            new_task_id,
+            task["title"],
+            task["config"],
             None,
             TaskStatus.DRAFT,
         )
