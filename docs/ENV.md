@@ -1,4 +1,4 @@
-# Environment Variables
+    # Environment Variables
 
 ### OPENAI_API_KEY
 The API key for the OpenAI API.

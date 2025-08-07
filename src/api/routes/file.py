@@ -25,8 +25,12 @@ router = APIRouter()
 async def get_upload_presigned_url(
     request: PresignedUrlRequest,
 ) -> PresignedUrlResponse:
-    if not settings.s3_folder_name:
-        raise HTTPException(status_code=500, detail="S3 folder name is not set")
+    # Check if we're in local development mode
+    if settings.env == "local" or not settings.s3_folder_name or not settings.s3_bucket_name:
+        raise HTTPException(
+            status_code=501, 
+            detail="S3 upload is not configured for local development. Please use the /file/upload-local endpoint instead."
+        )
 
     try:
         s3_client = boto3.client(
@@ -58,7 +62,10 @@ async def get_upload_presigned_url(
 
     except ClientError as e:
         logger.error(f"Error generating presigned URL: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to generate presigned URL")
+        raise HTTPException(
+            status_code=503, 
+            detail=f"AWS S3 service error: {str(e)}. Please check your AWS credentials and S3 configuration."
+        )
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         traceback.print_exc()

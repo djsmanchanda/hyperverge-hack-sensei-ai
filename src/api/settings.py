@@ -41,13 +41,18 @@ settings = get_settings()
 if settings.phoenix_api_key is not None:
     os.environ["PHOENIX_API_KEY"] = settings.phoenix_api_key
 
-tracer_provider = register(
-    protocol="http/protobuf",
-    project_name=f"sensai-{settings.env}",
-    auto_instrument=True,
-    batch=True,
-    endpoint=(
-        f"{settings.phoenix_endpoint}/v1/traces" if settings.phoenix_endpoint else None
-    ),
-)
-tracer = tracer_provider.get_tracer(__name__)
+# Only register telemetry if Phoenix endpoint is configured
+if settings.phoenix_endpoint is not None and settings.phoenix_api_key is not None:
+    tracer_provider = register(
+        protocol="http/protobuf",
+        project_name=f"sensai-{settings.env}",
+        auto_instrument=True,
+        batch=True,
+        endpoint=f"{settings.phoenix_endpoint}/v1/traces",
+    )
+    tracer = tracer_provider.get_tracer(__name__)
+else:
+    # Create a no-op tracer when Phoenix is not configured
+    from opentelemetry import trace
+    tracer_provider = trace.NoOpTracerProvider()
+    tracer = tracer_provider.get_tracer(__name__)

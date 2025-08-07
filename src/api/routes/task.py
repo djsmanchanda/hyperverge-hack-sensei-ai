@@ -44,13 +44,18 @@ async def get_learning_material_tasks_for_course(
 async def create_draft_task_for_course(
     request: CreateDraftTaskRequest,
 ) -> CreateDraftTaskResponse:
-    id, _ = await create_draft_task_for_course_in_db(
-        request.title,
-        str(request.type),
-        request.course_id,
-        request.milestone_id,
-    )
-    return {"id": id}
+    try:
+        id, _ = await create_draft_task_for_course_in_db(
+            request.title,
+            str(request.type),
+            request.course_id,
+            request.milestone_id,
+        )
+        return {"id": id}
+    except ValueError as e:
+        if "Course not found" in str(e):
+            raise HTTPException(status_code=404, detail="Course not found")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/{task_id}/learning_material", response_model=LearningMaterialTask)
@@ -117,9 +122,14 @@ async def update_published_quiz(
 async def duplicate_task(
     request: DuplicateTaskRequest,
 ) -> DuplicateTaskResponse:
-    return await duplicate_task_in_db(
-        request.task_id, request.course_id, request.milestone_id
-    )
+    try:
+        return await duplicate_task_in_db(
+            request.task_id, request.course_id, request.milestone_id
+        )
+    except ValueError as e:
+        if "Course not found" in str(e):
+            raise HTTPException(status_code=404, detail="Course not found")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/{task_id}")

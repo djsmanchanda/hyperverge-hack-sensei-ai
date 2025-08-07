@@ -57,7 +57,10 @@ async def get_all_courses_for_org(org_id: int) -> List[Course]:
 async def get_course(
     course_id: int, only_published: bool = True
 ) -> CourseWithMilestonesAndTasks:
-    return await get_course_from_db(course_id, only_published)
+    course = await get_course_from_db(course_id, only_published)
+    if course is None:
+        raise HTTPException(status_code=404, detail="Course not found")
+    return course
 
 
 @router.post("/tasks")
@@ -82,12 +85,17 @@ async def update_task_orders(request: UpdateTaskOrdersRequest):
 async def add_milestone_to_course(
     course_id: int, request: AddMilestoneToCourseRequest
 ) -> AddMilestoneToCourseResponse:
-    milestone_id, _ = await add_milestone_to_course_in_db(
-        course_id,
-        request.name,
-        request.color,
-    )
-    return {"id": milestone_id}
+    try:
+        milestone_id, _ = await add_milestone_to_course_in_db(
+            course_id,
+            request.name,
+            request.color,
+        )
+        return {"id": milestone_id}
+    except ValueError as e:
+        if "Course not found" in str(e):
+            raise HTTPException(status_code=404, detail="Course not found")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.put("/milestones/order")
