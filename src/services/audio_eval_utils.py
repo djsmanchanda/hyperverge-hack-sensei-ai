@@ -5,6 +5,7 @@ def build_enhanced_scorecard_payload(
     evaluation_result: Any,
     question_blocks: List[Dict],
     question_scorecard: Dict,
+    speech_analysis: Dict | None = None,
 ) -> Dict:
     """Build a frontend-compatible payload from an enhanced evaluation.
 
@@ -46,36 +47,53 @@ def build_enhanced_scorecard_payload(
                 "pass_score": 6,
             }
 
-        max_score = int(criterion.get("max_score", 10))
-        min_score = int(criterion.get("min_score", 0))
-        pass_score = int(criterion.get("pass_score", max_score))
+        orig_max = int(criterion.get("max_score", 10)) or 10
+        orig_pass = int(criterion.get("pass_score", max(1, int(0.6 * orig_max))))
 
-        # Normalize score into the criterion range
-        raw_score = getattr(score_item, "score", max_score)
-        scaled_score = raw_score
-        if max_score == 5 and raw_score > 5:
-            scaled_score = (raw_score / 10) * 5
-        elif max_score == 10 and raw_score <= 5:
-            # scale 1-5 into 1-10 range
-            scaled_score = ((raw_score - 1) / 4) * (max_score - min_score) + min_score
-
+        # Normalize raw score to a unified 10-point scale for display
+        raw_score = float(getattr(score_item, "score", 0) or 0)
+        base_scale = 5.0 if raw_score <= 5.0 else 10.0
         try:
-            final_score = float(max(min_score, min(max_score, scaled_score)))
+            score_10 = max(0.0, min(10.0, (raw_score / base_scale) * 10.0))
         except Exception:
-            final_score = float(max_score)
+            score_10 = 0.0
+
+        # Scale pass score proportionally to 10-point scale
+        try:
+            pass_10 = max(0.0, min(10.0, (orig_pass / float(orig_max)) * 10.0))
+        except Exception:
+            pass_10 = 6.0
 
         raw_rows.append(
             {
                 "category": criterion["name"],
                 "feedback_text": getattr(score_item, "feedback", ""),
-                "score": final_score,
-                "max_score": max_score,
-                "pass_score": pass_score,
+                "score": round(score_10, 1),
+                "max_score": 10,
+                "pass_score": round(pass_10, 0),
             }
         )
 
     # Convert to frontend schema
     scorecard_rows: List[Dict] = []
+
+    # Guardrail: multi-speaker detection alert row (if analysis indicates)
+    try:
+        if speech_analysis and speech_analysis.get("multi_speaker_suspected"):
+            scorecard_rows.append(
+                {
+                    "category": "VALIDATION",
+                    "feedback": {
+                        "correct": None,
+                        "wrong": "Multiple speakers detected in the recording. Please submit a single-speaker response for accurate evaluation.",
+                    },
+                    "score": 0,
+                    "max_score": 0,
+                    "pass_score": 0,
+                }
+            )
+    except Exception:
+        pass
     for row in raw_rows:
         scorecard_rows.append(
             {

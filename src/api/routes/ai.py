@@ -474,16 +474,35 @@ async def ai_response_for_question(request: AIChatRequest):
                                 )
                             # Build payload via utility for consistency
                             from services.audio_eval_utils import build_enhanced_scorecard_payload
+                            # Log raw evaluation scores for debugging
+                            try:
+                                logger.info(
+                                    "Raw evaluation scores: %s",
+                                    [
+                                        {
+                                            "criterion": getattr(s, "criterion", None),
+                                            "score": getattr(s, "score", None),
+                                            "feedback": getattr(s, "feedback", None),
+                                        }
+                                        for s in getattr(evaluation_result, "scores", []) or []
+                                    ],
+                                )
+                            except Exception as _log_err:
+                                logger.warning(f"Failed to log raw evaluation scores: {_log_err}")
+
                             output_dict = build_enhanced_scorecard_payload(
                                 evaluation_result,
                                 question_blocks=question["blocks"],
                                 question_scorecard=question["scorecard"],
+                                speech_analysis=getattr(evaluation_result, 'speech_analysis', None),
                             )
                             
                             try:
+                                rows = output_dict.get("scorecard", [])
                                 logger.info(
-                                    f"✅ Built enhanced scorecard with {len(output_dict.get('scorecard', []))} criteria"
+                                    "✅ Built enhanced scorecard with %d criteria", len(rows)
                                 )
+                                logger.info("Mapped scorecard rows: %s", rows)
                             except Exception:
                                 logger.info("✅ Built enhanced scorecard")
                             
