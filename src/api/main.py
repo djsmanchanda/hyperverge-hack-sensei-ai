@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 import os
 from os.path import exists
 from api.config import UPLOAD_FOLDER_NAME
@@ -59,6 +60,39 @@ if settings.bugsnag_api_key:
 
 
 app = FastAPI(lifespan=lifespan)
+
+# Add request validation error handler for debugging
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    from api.utils.logging import logger
+    
+    # Get request body
+    try:
+        body = await request.body()
+        body_str = body.decode('utf-8') if body else 'No body'
+    except Exception as e:
+        body_str = f"Error reading body: {e}"
+    
+    # Log detailed validation error information
+    logger.error(f"=== VALIDATION ERROR ===")
+    logger.error(f"Method: {request.method}")
+    logger.error(f"URL: {request.url}")
+    logger.error(f"Headers: {dict(request.headers)}")
+    logger.error(f"Request body: {body_str}")
+    logger.error(f"Validation errors: {exc.errors()}")
+    logger.error(f"========================")
+    
+    # Return detailed error response
+    return JSONResponse(
+        status_code=422,
+        content={
+            "message": "Request validation failed",
+            "errors": exc.errors(),
+            "request_body": body_str[:500],  # Limit body size in response
+            "url": str(request.url),
+            "method": request.method
+        }
+    )
 
 # Add Bugsnag middleware if configured
 if settings.bugsnag_api_key:
