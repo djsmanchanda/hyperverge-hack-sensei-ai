@@ -55,7 +55,7 @@ from api.utils.s3 import (
     download_file_from_s3_as_bytes,
     get_media_upload_s3_key_from_uuid,
 )
-from api.utils.audio import audio_service
+from api.utils.audio import audio_service, prepare_audio_input_for_ai
 from api.settings import tracer
 from opentelemetry.trace import StatusCode, Status
 from openinference.instrumentation import using_attributes
@@ -258,10 +258,8 @@ async def ai_response_for_question(request: AIChatRequest):
 
     # Define an async generator for streaming
     async def stream_response() -> AsyncGenerator[str, None]:
-        # Fix the tracer span creation - remove problematic method calls
         with tracer.start_as_current_span("ai_chat") as span:
-            # Remove: span.set_input(chat_history)
-            # The NonRecordingSpan doesn't support this method
+            # Remove problematic span method calls that don't exist on NonRecordingSpan
             
             if request.task_type == TaskType.LEARNING_MATERIAL:
                 with using_attributes(
@@ -445,14 +443,16 @@ async def ai_response_for_question(request: AIChatRequest):
                     # Process the async generator
                     async for chunk in stream:
                         content = json.dumps(chunk.model_dump()) + "\n"
-                        output_buffer = content
+                        output_buffer.append(content)  # Change from = to .append()
                         yield content
             except Exception as error:
                 span.record_exception(error)
                 span.set_status(Status(StatusCode.ERROR))
                 raise error
             else:
-                span.set_output("".join(output_buffer))
+                # Only call span methods if they exist
+                if hasattr(span, 'set_output'):
+                    span.set_output("".join(output_buffer))
                 span.set_status(Status(StatusCode.OK))
 
     # Return a streaming response
@@ -472,12 +472,6 @@ async def migrate_content_to_blocks(content: str) -> List[Dict]:
         )
         language: Optional[str] = Field(
             description="The language of the code block (for a codeBlock block); always the full name of the language in lowercase (e.g. python, javascript, sql, html, css, etc.)"
-        )
-        name: Optional[str] = Field(
-            description="The name of the image (for an image block)"
-        )
-        url: Optional[str] = Field(
-            description="The URL of the image (for an image block)"
         )
 
     class BlockContentStyle(BaseModel):
