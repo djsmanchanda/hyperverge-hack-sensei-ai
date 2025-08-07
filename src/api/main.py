@@ -31,10 +31,14 @@ from api.scheduler import scheduler
 from api.settings import settings
 import bugsnag
 from bugsnag.asgi import BugsnagMiddleware
+from api.db import init_db
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Ensure database is initialized (creates/migrates tables)
+    await init_db()
+
     scheduler.start()
 
     # Create the uploads directory if it doesn't exist

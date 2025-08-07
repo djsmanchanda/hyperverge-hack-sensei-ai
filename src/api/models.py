@@ -1,5 +1,5 @@
 from enum import Enum
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Tuple, Optional, Dict, Literal
 from datetime import datetime
 
@@ -705,3 +705,42 @@ class SaveCodeDraftRequest(BaseModel):
 class CodeDraft(BaseModel):
     id: int
     code: List[LanguageCodeDraft]
+
+
+class CriterionScore(BaseModel):
+    criterion: str = Field(description="The criterion being evaluated")
+    score: int = Field(description="Score for this criterion (1-5)")
+    feedback: str = Field(description="Detailed feedback for this criterion")
+    transcript_references: List[str] = Field(default=[], description="References to transcript parts")
+
+class ActionableTip(BaseModel):
+    description: str = Field(description="Actionable tip for improvement")
+    timestamp_ranges: List[Dict] = Field(default=[], description="Timestamp ranges for audio references")
+
+class InterviewEvaluationResponse(BaseModel):
+    scores: List[CriterionScore] = Field(description="Detailed scores for each criterion")
+    overall_score: float = Field(description="Overall score (1-5)")
+    actionable_tips: List[ActionableTip] = Field(description="Actionable tips for improvement")
+    transcript: str = Field(description="Full transcript of the response")
+    speech_analysis: Dict = Field(description="Speech analysis data")
+    duration_seconds: float = Field(description="Duration of the response in seconds")
+
+class ProbingQuestion(BaseModel):
+    question: str = Field(description="The probing question to test understanding")
+    question_type: Literal["explanation", "modification", "alternative", "prediction"] = Field(
+        description="Type of probing question"
+    )
+    expected_concepts: List[str] = Field(description="Key concepts the answer should demonstrate")
+
+class ProbingEvaluation(BaseModel):
+    understanding_demonstrated: bool = Field(description="Whether learner demonstrated understanding")
+    concept_coverage: Dict[str, bool] = Field(description="Which expected concepts were covered")
+    feedback: str = Field(description="Detailed feedback on the explanation")
+    follow_up_needed: bool = Field(description="Whether another probing question is needed")
+    certification_ready: bool = Field(description="Whether ready for certification")
+
+class UnderstandingCertification(BaseModel):
+    certified: bool = Field(description="Whether understanding is certified")
+    certification_message: str = Field(description="Certification acknowledgment message")
+    mastery_level: Literal["basic", "proficient", "advanced"] = Field(description="Level of mastery demonstrated")
+    concepts_mastered: List[str] = Field(description="List of concepts fully understood")

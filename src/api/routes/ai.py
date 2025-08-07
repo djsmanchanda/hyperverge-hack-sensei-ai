@@ -22,6 +22,11 @@ from api.models import (
     GenerateCourseJobStatus,
     GenerateTaskJobStatus,
     QuestionType,
+    InterviewEvaluationResponse,  # Add this import
+    CriterionScore,
+    ProbingQuestion,
+    ProbingEvaluation,
+    UnderstandingCertification  # Add this import
 )
 from api.llm import run_llm_with_instructor, stream_llm_with_instructor
 from api.settings import settings
@@ -43,11 +48,14 @@ from api.db.task import (
 )
 from api.db.course import (
     store_course_generation_request,
-    get_course_generation_job_details,
-    update_course_generation_job_status_and_details,
-    update_course_generation_job_status,
-    get_all_pending_course_structure_generation_jobs,
     add_milestone_to_course,
+)
+from api.db.probing import (
+    create_probing_session,
+    update_probing_session_with_question,
+    update_probing_session_with_response,
+    create_understanding_certification,
+    get_probing_session,
 )
 from api.db.chat import get_question_chat_history_for_user
 from api.db.utils import construct_description_from_blocks
@@ -259,7 +267,15 @@ async def ai_response_for_question(request: AIChatRequest):
     # Define an async generator for streaming
     async def stream_response() -> AsyncGenerator[str, None]:
         with tracer.start_as_current_span("ai_chat") as span:
-            # Remove problematic span method calls that don't exist on NonRecordingSpan
+            # Check if this is a probing session
+            probing_session = None
+            if hasattr(request, 'probing_session_uuid') and request.probing_session_uuid:
+                probing_session = await get_probing_session(request.probing_session_uuid)
+            
+            # Determine session state and modify system prompt accordingly
+            session_state = "initial"
+            if probing_session:
+                session_state = probing_session.get("session_state", "initial")
             
             if request.task_type == TaskType.LEARNING_MATERIAL:
                 with using_attributes(
@@ -298,7 +314,6 @@ async def ai_response_for_question(request: AIChatRequest):
                 if request.response_type == ChatResponseType.AUDIO:
                     model = openai_plan_to_model_name["audio"]
                 else:
-
                     class Output(BaseModel):
                         use_reasoning_model: bool = Field(
                             description="Whether to use a reasoning model to evaluate the student's response"
@@ -339,7 +354,6 @@ async def ai_response_for_question(request: AIChatRequest):
 
                 if request.task_type == TaskType.QUIZ:
                     if question["type"] == QuestionType.OBJECTIVE:
-
                         class Output(BaseModel):
                             analysis: str = Field(
                                 description="A detailed analysis of the student's response"
@@ -350,9 +364,7 @@ async def ai_response_for_question(request: AIChatRequest):
                             is_correct: bool = Field(
                                 description="Whether the student's response correctly solves the original task that the student is supposed to solve. For this to be true, the original task needs to be completely solved and not just partially solved. Giving the right answer to one step of the task does not count as solving the entire task."
                             )
-
                     else:
-
                         class Feedback(BaseModel):
                             correct: Optional[str] = Field(
                                 description="What worked well in the student's response for this category based on the scoring criteria"
@@ -385,9 +397,7 @@ async def ai_response_for_question(request: AIChatRequest):
                             scorecard: Optional[List[Row]] = Field(
                                 description="List of rows with one row for each category from scoring criteria; only include this in the response if the student's response is an answer to the task"
                             )
-
                 else:
-
                     class Output(BaseModel):
                         response: str = Field(
                             description="Response to the student's query; add proper formatting to the response to make it more readable where necessary"
@@ -419,32 +429,137 @@ async def ai_response_for_question(request: AIChatRequest):
                     if knowledge_base:
                         context_instructions = f"""\n\nMake sure to use only the information provided within ``` below for responding to the student while ignoring any other information that contradicts the information provided:\n\n```\n{knowledge_base}\n```"""
 
+                    # Ensure a default system prompt is set for QUIZ
+                    system_prompt = f"""{context_instructions}
+{format_instructions}"""
+
                     if question["type"] == QuestionType.OBJECTIVE:
-                        system_prompt = f"""You are a Socratic tutor who guides a student step-by-step as a coach would, encouraging them to arrive at the correct answer on their own without ever giving away the right answer to the student straight away.\n\nYou will receive:\n\n- Task description\n- Conversation history with the student\n- Task solution (for your reference only; do not reveal){context_instructions}\n\nYou need to evaluate the student's response for correctness and give your feedback that can be shared with the student.\n\n{format_instructions}\n\nGuidelines on assessing correctness of the student's answer:\n\n- Once the student has provided an answer that is correct with respect to the solution provided at the start, clearly acknowledge that they have got the correct answer and stop asking any more reflective questions. Your response should make them feel a sense of completion and accomplishment at a job well done.\n- If the question is one where the answer does not need to match word-for-word with the solution (e.g. definition of a term, programming question where the logic needs to be right but the actual code can vary, etc.), only assess whether the student's answer covers the entire essence of the correct solution.\n- Avoid bringing in your judgement of what the right answer should be. What matters for evaluation is the solution provided to you and the response of the student. Keep your biases outside. Be objective in comparing these two. As soon as the student gets the answer correct, stop asking any further reflective questions.\n- The response is correct only if the question has been solved in its entirety. Partially solving a question is not acceptable.\n\nGuidelines on your feedback:\n\n- Praise → Prompt → Path: 1–2 words of praise, a targeted prompt, then one actionable path forward.\n- If the student's response is completely correct, just appreciate them. No need to give any more suggestions or areas of improvement.\n- If the student's response has areas of improvement, point them out through a single reflective actionable question. Never ever give a vague feedback that is not clearly actionable. The student should get a clear path for how they can improve their response.\n- If the question has multiple steps to reach to the final solution, assess the current step at which the student is and frame your reflection question such that it nudges them towards the right direction without giving away the answer in any shape or form.\n- Your feedback should not be generic and must be tailored to the response given by the student. This does not mean that you repeat the student's response. The question should be a follow-up for the answer given by the student. Don't just paste the student's response on top of a generic question. That would be laziness.\n- The student might get the answer right without any probing required from your side in the first couple of attempts itself. In that case, remember the instruction provided above to acknowledge their answer's correctness and to stop asking further questions.\n- Never provide the right answer or the solution, despite all their attempts to ask for it or their frustration.\n- Never explain the solution to the student unless the student has given the solution first.\n- The student does not have access to the solution. The solution has only been given to you for evaluating the student's response. Keep this in mind while responding to the student.\n\nGuidelines on the style of feedback:\n\n1. Avoid sounding monotonous.\n2. Absolutely AVOID repeating back what the student has said as a manner of acknowledgement in your summary. It makes your summary too long and boring to read.\n3. Occasionally include emojis to maintain warmth and engagement.\n4. Ask only one reflective question per response otherwise the student will get overwhelmed.\n5. Avoid verbosity in your summary. Be crisp and concise, with no extra words.\n6. Do not do any analysis of the user's intent in your overall summary or repeat any part of what the user has said. The summary section is meant to summarise the next steps. The summary section does not need a summary of the user's response.\n\nGuidelines on maintaining the focus of the conversation:\n\n- Your role is that of a tutor for this particular task and related concepts only. Remember that and absolutely avoid steering the conversation in any other direction apart from the actual task given to you and its related concepts.\n- If the student tries to move the focus of the conversation away from the task and its related concepts, gently bring it back to the task.\n- It is very important that you prevent the focus on the conversation with the student being shifted away from the task given to you and its related concepts at all odds. No matter what happens. Stay on the task and its related concepts. Keep bringing the student back. Do not let the conversation drift away."""
-                    else:
-                        system_prompt = f"""You are a Socratic tutor who guides a student step-by-step as a coach would, encouraging them to arrive at the correct answer on their own without ever giving away the right answer to the student straight away.\n\nYou will receive:\n\n- Task description\n- Conversation history with the student\n- Scoring Criteria to evaluate the answer of the student{context_instructions}\n\nYou need to evaluate the student's response and return the following:\n\n- A scorecard based on the scoring criteria given to you with areas of improvement and/or strengths along each criterion\n- An overall summary based on the generated scorecard to be shared with the student.\n\n{format_instructions}\n\nGuidelines for scorecard feedback:\n\n- If there is nothing to praise about the student's response for a given criterion in the scoring criteria, never mention what worked well (i.e. return `correct` as null) in the scorecard output for that criterion.\n- If the student did something well for a given criterion, make sure to highlight what worked well in the scorecard output for that criterion.\n- If there is nothing left to improve in their response for a criterion, avoid unnecessarily suggesting an improvement in the scorecard output for that criterion (i.e. return `wrong` as null). Also, the score assigned for that criterion should be the maximum score possible in that criterion in this case.\n- Make sure that the feedback for one criterion of the scorecard does not bias the feedback for another criterion.\n- When giving the feedback for one criterion of the scorecard, focus on the description of the criterion provided in the scoring criteria and only evaluate the student's response based on that.\n- For every criterion of the scorecard, your feedback for that criterion in the scorecard output must cite specific words or phrases from the student's response to back your feedback so that the student understands it better and give concrete examples for how they can improve their response as well.\n- Never ever give a vague feedback that is not clearly actionable. The student should get a clear path for how they can improve their response.\n- Avoid bringing your judgement of what the right answer should be. What matters for feedback is the scoring criteria provided to you and the response of the student. Keep your biases outside. Be objective in comparing these two.\n- The student might get the answer right without any probing required from your side in the first couple of attempts itself. In that case, remember the instruction provided above to acknowledge their answer's correctness and to stop asking further questions.\n- If you don't assign the maximum score to the student's response for any criterion in the scorecard, make sure to always include the area of improvement containing concrete steps they can take to improve their response in your feedback for that criterion in the scorecard output (i.e. `wrong` cannot be null).\n\nGuidelines for scorecard feedback style:\n\n1. Avoid sounding monotonous.\n2. Be crisp and concise, with no extra words.\n\nGuidelines for summary:\n- Praise → Prompt → Path: 1–2 words of praise, a targeted prompt, then one actionable path forward.\n- It should clearly outline what the next steps need to be based on the scoring criteria. It should be very crisp and only contain the summary of the next steps outlined in the scorecard feedback.\n- Your overall summary does not need to quote specific words from the user's response or reflect back what the user's response means. Keep that for the feedback in the scorecard output.\n- If the student's response is completely correct, just appreciate them. No need to give any more suggestions or areas of improvement.\n- If the student's response has areas of improvement, point them out through a single reflective actionable question.\n- Your summary and follow-up question should not be generic and must be tailored to the response given by the student. This does not mean that you repeat the student's response. The question should be a follow-up for the answer given by the student. Don't just paste the student's response on top of a generic question. That would be laziness.\n- Never provide the right answer or the solution, despite all their attempts to ask for it or their frustration.\n- Never explain the solution to the student unless the student has given the solution first.\n\nGuidelines for style of summary:\n\n1. Avoid sounding monotonous.\n2. Absolutely AVOID repeating back what the student has said as a manner of acknowledgement in your summary. It makes your summary too long and boring to read.\n3. Occasionally include emojis to maintain warmth and engagement.\n4. Ask only one reflective question per response otherwise the student will get overwhelmed.\n5. Avoid verbosity in your summary.\n6. Do not do any analysis of the user's intent in your overall summary or repeat any part of what the user has said. The summary section is meant to summarise the next steps. The summary section does not need a summary of the user's response.\n\nGuidelines on maintaining the focus of the conversation:\n\n- Your role is that of a tutor for this particular task and related concepts only. Remember that and absolutely avoid steering the conversation in any other direction apart from the actual task given to you and its related concepts.\n- If the student tries to move the focus of the conversation away from the task and its related concepts, gently bring it back to the task.\n- It is very important that you prevent the focus on the conversation with the student being shifted away from the task given to you and its related concepts at all odds. No matter what happens. Stay on the task and its related concepts. Keep bringing the student back. Do not let the conversation drift away.\n\nGuidelines on when to show the scorecard:\n\n- If the response by the student is not a valid answer to the actual task given to them (e.g. if their response is an acknowledgement of the previous messages or a doubt or a question or something irrelevant to the task), do not provide any scorecard in that case and only return a summary addressing their response.\n- For messages of acknowledgement, you do not need to explicitly call it out as an acknowledgement. Simply respond to it normally."""
+                        system_prompt = f"""You are a Socratic tutor who guides students and tests deep understanding through probing questions.
+
+EVALUATION FLOW:
+1. **Initial Assessment**: Check if the student's response is correct
+2. **Probing Trigger**: If correct AND first attempt, generate a probing question
+3. **Understanding Evaluation**: If answering probing question, evaluate comprehension
+4. **Certification**: Award when mastery is demonstrated
+
+PROBING QUESTION STRATEGY:
+Generate questions that require the student to demonstrate understanding:
+- EXPLANATION: "Walk me through your solution step by step and explain why each step works"
+- MODIFICATION: "If I changed [specific element], what would happen and why?"
+- ALTERNATIVE: "What other approaches could work here, and what are the trade-offs?"
+- PREDICTION: "How would you explain this concept to someone who's never seen it before?"
+
+CERTIFICATION CRITERIA:
+- Student demonstrates clear understanding of underlying concepts
+- Can explain reasoning coherently
+- Shows ability to apply knowledge to variations
+- Covers key concepts expected for this question
+
+{context_instructions}
+{format_instructions}"""
+
+                    elif session_state == "probing":
+                        system_prompt = f"""You are evaluating a student's response to a probing question that tests their understanding.
+
+PREVIOUS CONTEXT:
+- Student correctly answered: {probing_session['initial_correct_answer']}
+- Probing question asked: {probing_session['probing_question']}
+- Current response: [student's current response]
+
+EVALUATION FOCUS:
+- Does the student understand WHY their solution works?
+- Can they explain the underlying concepts?
+- Do they demonstrate transfer of knowledge?
+- Are they ready for understanding certification?
+
+CERTIFICATION DECISION:
+- Award certification if they show genuine comprehension
+- Provide constructive feedback if understanding is incomplete
+- Generate follow-up probing if needed
+
+{context_instructions}
+{format_instructions}"""
                 else:
-                    system_prompt = f"""You are a teaching assistant.\n\nYou will receive:\n- A Reference Material\n- Conversation history with a student\n- The student's latest query/message.\n\nYour role:\n- You need to respond to the student's message based on the content in the reference material provided to you.\n- If the student's query is absolutely not relevant to the reference material or goes beyond the scope of the reference material, clearly saying so without indulging their irrelevant queries. The only exception is when they are asking deeper questions related to the learning material that might not be mentioned in the reference material itself to clarify their conceptual doubts. In this case, you can provide the answer and help them.\n- Remember that the reference material is in read-only mode for the student. So, they cannot make any changes to it.\n\n{format_instructions}\n\nGuidelines on your response style:\n- Be crisp, concise and to the point.\n- Vary your phrasing to avoid monotony; occasionally include emojis to maintain warmth and engagement.\n- Playfully redirect irrelevant responses back to the task without judgment.\n- If the task involves code, format code snippets or variable/function names with backticks (`example`).\n- If including HTML, wrap tags in backticks (`<html>`).\n- If your response includes rich text format like lists, font weights, tables, etc. always render them as markdown.\n- Avoid being unnecessarily verbose in your response.\n\nGuideline on maintaining focus:\n- Your role is that of a teaching assistant for this particular task and its related concepts only. Remember that and absolutely avoid steering the conversation in any other direction apart from the actual task and its related concepts give to you.\n- If the student tries to move the focus of the conversation away from the task and its related concepts, gently bring it back.\n- It is very important that you prevent the focus on the conversation with the student being shifted away from the task and its related concepts given to you at all odds. No matter what happens. Stay on the task and its related concepts. Keep bringing the student back to the task and its related concepts. Do not let the conversation drift away."""
+                    # Non-quiz: generic system prompt using format instructions
+                    system_prompt = f"""You are a helpful tutor.
+
+{format_instructions}"""
 
                 messages = [{"role": "system", "content": system_prompt}] + chat_history
 
+                # Create streaming response from LLM
                 with using_attributes(
-                    session_id=f"{session_id}",
+                    session_id=session_id,
                     user_id=str(request.user_id),
-                    metadata={"stage": "feedback", **metadata},
+                    metadata={"stage": "llm", **metadata},
                 ):
                     stream = await stream_llm_with_instructor(
                         api_key=settings.openai_api_key,
                         model=model,
                         messages=messages,
                         response_model=Output,
-                        max_completion_tokens=4096,
+                        max_completion_tokens=8192,
                     )
-                    # Process the async generator
-                    async for chunk in stream:
-                        content = json.dumps(chunk.model_dump()) + "\n"
-                        output_buffer.append(content)  # Change from = to .append()
-                        yield content
+
+                # Process streaming response
+                async for chunk in stream:
+                    # Default content
+                    content = json.dumps(chunk.model_dump()) + "\n"
+
+                    # Handle probing logic (objective questions only)
+                    if (
+                        question["type"] == QuestionType.OBJECTIVE
+                        and getattr(chunk, "is_correct", False)
+                        and not probing_session
+                        and session_state == "initial"
+                    ):
+                        # Create probing session
+                        session_uuid = await create_probing_session(
+                            request.user_id,
+                            request.question_id or "preview",
+                            request.task_id,
+                            request.user_response
+                        )
+
+                        if getattr(chunk, "probe_me_question", None):
+                            await update_probing_session_with_question(
+                                session_uuid,
+                                chunk.probe_me_question.question,
+                                chunk.probe_me_question.question_type
+                            )
+
+                            # Add session UUID to response
+                            chunk_data = chunk.model_dump()
+                            chunk_data["probing_session_uuid"] = session_uuid
+                            content = json.dumps(chunk_data) + "\n"
+
+                    elif probing_session and getattr(chunk, "probing_evaluation", None):
+                        # Handle probing evaluation
+                        await update_probing_session_with_response(
+                            probing_session["session_uuid"],
+                            request.user_response,
+                            chunk.probing_evaluation.understanding_demonstrated,
+                            chunk.probing_evaluation.certification_ready,
+                            chunk.understanding_certification.mastery_level if getattr(chunk, "understanding_certification", None) else None,
+                            chunk.understanding_certification.concepts_mastered if getattr(chunk, "understanding_certification", None) else None
+                        )
+
+                        if getattr(chunk, "understanding_certification", None) and chunk.understanding_certification.certified:
+                            # Create certification record
+                            await create_understanding_certification(
+                                request.user_id,
+                                request.question_id or "preview",
+                                request.task_id,
+                                probing_session["session_uuid"],
+                                chunk.understanding_certification.mastery_level,
+                                chunk.understanding_certification.concepts_mastered,
+                                1  # probing_attempts
+                            )
+
+                    # Emit content
+                    output_buffer.append(content)
+                    yield content
+
             except Exception as error:
                 span.record_exception(error)
                 span.set_status(Status(StatusCode.ERROR))
@@ -1143,14 +1258,14 @@ async def resume_pending_task_generation_jobs():
         return
 
     tasks = []
-
-    client = instructor.from_openai(
-        openai.AsyncOpenAI(
-            api_key=settings.openai_api_key,
-        )
-    )
-
+    
     for job in incomplete_course_jobs:
+        client = instructor.from_openai(
+            openai.AsyncOpenAI(
+                api_key=settings.openai_api_key,
+            )
+        )
+        
         tasks.append(
             generate_course_task(
                 client,
@@ -1166,62 +1281,6 @@ async def resume_pending_task_generation_jobs():
     await async_batch_gather(tasks, description="Resuming task generation jobs")
 
 
-class CriterionScore(BaseModel):
-    criterion: str
-    score: int = Field(..., ge=1, le=5)
-    feedback: str
-    transcript_references: List[str] = Field(default_factory=list)
-
-class ActionableTip(BaseModel):
-    title: str
-    description: str
-    transcript_lines: List[str] = Field(default_factory=list)
-    timestamp_ranges: List[Dict] = Field(default_factory=list)
-    priority: int = Field(..., ge=1, le=3)
-
-class InterviewEvaluationResponse(BaseModel):
-    scores: List[CriterionScore]
-    overall_score: float
-    actionable_tips: List[ActionableTip]
-    transcript: str
-    speech_analysis: Dict
-    duration_seconds: float
-
-
-@router.post("/interview/evaluate")
-async def evaluate_interview_response(
-    audio_uuid: str,
-    question: str,
-    max_duration: int = 60,
-    user_id: Optional[str] = None
-):
-    """Evaluate audio interview response with transcription and rubric scoring"""
-    
-    try:
-        # Download audio file
-        if settings.s3_folder_name:
-            audio_data = download_file_from_s3_as_bytes(
-                get_media_upload_s3_key_from_uuid(audio_uuid, "wav")
-            )
-        else:
-            audio_file_path = os.path.join(settings.local_upload_folder, f"{audio_uuid}.wav")
-            with open(audio_file_path, "rb") as f:
-                audio_data = f.read()
-        
-        # Get AI evaluation using existing infrastructure
-        evaluation = await get_interview_ai_evaluation(
-            question=question,
-            audio_data=audio_data,
-            max_duration=max_duration
-        )
-        
-        return evaluation
-        
-    except Exception as e:
-        logger.error(f"Error in interview evaluation: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 async def get_interview_ai_evaluation(
     question: str,
     audio_data: bytes,
@@ -1229,17 +1288,18 @@ async def get_interview_ai_evaluation(
 ) -> InterviewEvaluationResponse:
     """Get AI evaluation for interview response"""
     
-    # Get transcription and analysis
-    transcription_result = audio_service.transcribe_with_analysis(audio_data)
-    
-    if "error" in transcription_result:
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {transcription_result['error']}")
-    
-    transcript = transcription_result["transcript"]
-    analysis = transcription_result["analysis"]
-    
-    # Enhanced AI evaluation prompt
-    system_prompt = f"""You are an expert interview coach evaluating a candidate's audio response.
+    try:
+        # Get transcription and analysis
+        transcription_result = audio_service.transcribe_with_analysis(audio_data)
+        
+        if "error" in transcription_result:
+            raise HTTPException(status_code=500, detail=f"Transcription failed: {transcription_result['error']}")
+        
+        transcript = transcription_result["transcript"]
+        analysis = transcription_result["analysis"]
+        
+        # Enhanced AI evaluation prompt
+        system_prompt = f"""You are an expert interview coach evaluating a candidate's audio response.
 
 EVALUATION CRITERIA (Score 1-5 for each):
 1. CONTENT (1-5): Accuracy, depth, and relevance of information
@@ -1262,7 +1322,6 @@ Provide detailed scores and specific feedback for each criterion. Reference spec
 
 Return 2-3 actionable tips for improvement with specific transcript references."""
 
-    try:
         # Use your existing LLM infrastructure
         response = await run_llm_with_instructor(
             api_key=settings.openai_api_key,
@@ -1294,6 +1353,7 @@ Return 2-3 actionable tips for improvement with specific transcript references."
         # Fallback evaluation
         return create_fallback_evaluation(transcript, analysis)
 
+
 def format_fillers_for_prompt(fillers: List) -> str:
     """Format filler analysis for AI prompt"""
     if not fillers:
@@ -1305,6 +1365,7 @@ def format_fillers_for_prompt(fillers: List) -> str:
         filler_summary[word] = filler_summary.get(word, 0) + 1
     
     return "\n".join([f"- '{word}': {count} times" for word, count in filler_summary.items()])
+
 
 def create_fallback_evaluation(transcript: str, analysis: Dict) -> InterviewEvaluationResponse:
     """Create a basic evaluation when AI fails"""
@@ -1339,14 +1400,29 @@ async def get_interview_prompts(category: str):
         ],
         "hr": [
             "Tell me about a time you had to work with a difficult team member.",
-            "Describe your greatest professional achievement.",
-            "Why are you interested in this role?",
-            "How do you handle stress and pressure?",
-            "Where do you see yourself in 5 years?"
         ]
     }
     
-    if category.lower() not in prompts:
-        raise HTTPException(status_code=404, detail="Category not found")
-    
-    return {"prompts": prompts[category.lower()]}
+    return {
+        "success": True,
+        "prompts": prompts.get(category, [])
+    }
+
+
+# Add to your existing Output classes in ai.py
+class EnhancedObjectiveOutput(BaseModel):
+    analysis: str = Field(description="Detailed analysis of student's response")
+    feedback: str = Field(description="Feedback on the student's response")
+    is_correct: bool = Field(description="Whether the response is correct")
+    probe_me_question: Optional[ProbingQuestion] = Field(
+        description="Probing question if answer is correct and first attempt"
+    )
+    probing_evaluation: Optional[ProbingEvaluation] = Field(
+        description="Evaluation of probing response"
+    )
+    understanding_certification: Optional[UnderstandingCertification] = Field(
+        description="Certification of understanding when mastery is demonstrated"
+    )
+    session_state: Literal["initial", "correct_answer", "probing", "certified"] = Field(
+        default="initial", description="Current state of the learning session"
+    )

@@ -462,6 +462,54 @@ async def create_code_drafts_table(cursor):
     )
 
 
+async def create_probing_sessions_table(cursor):
+    await cursor.execute(
+        """CREATE TABLE IF NOT EXISTS probing_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                question_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                session_uuid TEXT UNIQUE NOT NULL,
+                initial_correct_answer TEXT NOT NULL,
+                probing_question TEXT,
+                probing_type TEXT,
+                student_probing_response TEXT,
+                understanding_demonstrated INTEGER DEFAULT 0,
+                certification_achieved INTEGER DEFAULT 0,
+                mastery_level TEXT,
+                concepts_mastered TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                completed_at DATETIME,
+                session_state TEXT DEFAULT 'initial'
+            )"""
+    )
+    await cursor.execute(
+        """CREATE INDEX IF NOT EXISTS idx_probing_sessions_user_question
+            ON probing_sessions(user_id, question_id)"""
+    )
+
+async def create_understanding_certifications_table(cursor):
+    await cursor.execute(
+        """CREATE TABLE IF NOT EXISTS understanding_certifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                question_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                session_uuid TEXT NOT NULL,
+                certified_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                mastery_level TEXT NOT NULL,
+                concepts_mastered TEXT NOT NULL,
+                probing_attempts INTEGER DEFAULT 1,
+                total_session_time INTEGER,
+                FOREIGN KEY (session_uuid) REFERENCES probing_sessions(session_uuid)
+            )"""
+    )
+    await cursor.execute(
+        """CREATE INDEX IF NOT EXISTS idx_understanding_certifications_user
+            ON understanding_certifications(user_id)"""
+    )
+
+
 async def init_db():
     # Ensure the database folder exists
     db_folder = os.path.dirname(sqlite_db_path)
@@ -502,12 +550,22 @@ async def init_db():
                 await create_course_generation_jobs_table(cursor)
                 await create_task_generation_jobs_table(cursor)
                 await create_code_drafts_table(cursor)
+                # New probing-related tables
+                await create_probing_sessions_table(cursor)
+                await create_understanding_certifications_table(cursor)
             else:
                 # This is for migrations: if the DB exists, check for missing tables.
                 print("Database exists. Checking for missing tables...")
                 if not await check_table_exists(code_drafts_table_name, cursor):
                     print(f"Table '{code_drafts_table_name}' not found. Creating it...")
                     await create_code_drafts_table(cursor)
+                # Ensure probing tables exist
+                if not await check_table_exists('probing_sessions', cursor):
+                    print("Table 'probing_sessions' not found. Creating it...")
+                    await create_probing_sessions_table(cursor)
+                if not await check_table_exists('understanding_certifications', cursor):
+                    print("Table 'understanding_certifications' not found. Creating it...")
+                    await create_understanding_certifications_table(cursor)
 
             await conn.commit()
             print("Database initialization complete.")
