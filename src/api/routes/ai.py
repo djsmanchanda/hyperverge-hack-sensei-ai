@@ -4,7 +4,7 @@ import tempfile
 import random
 from collections import defaultdict
 import asyncio
-from fastapi import APIRouter, HTTPException, Body, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Body, BackgroundTasks, File, Form, UploadFile
 from fastapi.responses import StreamingResponse
 from typing import List, Optional, Dict, Literal, AsyncGenerator
 import json
@@ -55,7 +55,7 @@ from api.utils.s3 import (
     download_file_from_s3_as_bytes,
     get_media_upload_s3_key_from_uuid,
 )
-from api.utils.audio import audio_service, prepare_audio_input_for_ai
+from api.utils.audio import audio_service, prepare_audio_input_for_ai, enhanced_audio_service, speaker_service
 from api.settings import tracer
 from opentelemetry.trace import StatusCode, Status
 from openinference.instrumentation import using_attributes
@@ -1423,6 +1423,7 @@ class InterviewEvaluationResponse(BaseModel):
     actionable_tips: List[ActionableTip]
     transcript: str
     speech_analysis: Dict
+    speaker_analysis: Optional[Dict] = None
     duration_seconds: float
 
 
@@ -1458,6 +1459,91 @@ async def evaluate_interview_response(
     except Exception as e:
         logger.error(f"Error in interview evaluation: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/interview/evaluate-enhanced", response_model=InterviewEvaluationResponse)
+async def evaluate_interview_response_enhanced(
+    audio: UploadFile = File(...),
+    question: str = Form(...)
+):
+    """Enhanced interview evaluation with speaker detection and improved tip generation"""
+    try:
+        logger.info(f"🎯 Enhanced interview evaluation started for question: {question[:50]}...")
+        
+        # Read audio data
+        audio_data = await audio.read()
+        logger.info(f"📁 Audio file received: {len(audio_data)} bytes")
+        
+        # Enhanced transcription with analysis
+        transcription_result = audio_service.transcribe_with_analysis(audio_data)
+        if "error" in transcription_result:
+            raise HTTPException(status_code=400, detail=f"Transcription failed: {transcription_result['error']}")
+        
+        transcript = transcription_result["transcript"]
+        speech_analysis = transcription_result["analysis"]
+        logger.info(f"📝 Transcript: {transcript[:100]}...")
+        
+        # Enhanced speaker detection
+        speaker_analysis = None
+        try:
+            if speaker_service.is_available:
+                logger.info("🔍 Running speaker detection...")
+                speaker_result = speaker_service.detect_speakers(audio_data)
+                speaker_analysis = speaker_result
+                
+                # Add speaker analysis to speech analysis
+                speech_analysis["speaker_analysis"] = speaker_analysis
+                
+                if speaker_analysis.get("is_multi_speaker", False):
+                    logger.warning(f"⚠️ Multiple speakers detected: {speaker_analysis.get('num_speakers', 'unknown')}")
+            else:
+                logger.info("📢 Speaker detection unavailable, using single speaker mode")
+                speaker_analysis = {
+                    "num_speakers": 1,
+                    "is_multi_speaker": False,
+                    "confidence": 1.0,
+                    "method": "unavailable"
+                }
+                speech_analysis["speaker_analysis"] = speaker_analysis
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Speaker detection failed: {str(e)}, continuing with single speaker")
+            speaker_analysis = {
+                "num_speakers": 1,
+                "is_multi_speaker": False,
+                "confidence": 0.0,
+                "method": "error_fallback",
+                "error": str(e)
+            }
+            speech_analysis["speaker_analysis"] = speaker_analysis
+        
+        # Enhanced evaluation with improved tip generation
+        try:
+            logger.info("🤖 Generating enhanced AI evaluation...")
+            evaluation_result = await get_interview_ai_evaluation(
+                question=question,
+                audio_data=audio_data,
+                max_duration=120
+            )
+            
+            # Ensure enhanced data is included
+            evaluation_result.transcript = transcript
+            evaluation_result.speech_analysis = speech_analysis
+            evaluation_result.speaker_analysis = speaker_analysis
+            
+            logger.info(f"✅ Enhanced evaluation completed - Overall score: {evaluation_result.overall_score}")
+            return evaluation_result
+            
+        except Exception as ai_error:
+            logger.warning(f"⚠️ AI evaluation failed: {str(ai_error)}, using enhanced fallback")
+            # Use our enhanced fallback evaluation
+            fallback_result = create_enhanced_fallback_evaluation(transcript, speech_analysis, question)
+            fallback_result.speaker_analysis = speaker_analysis
+            return fallback_result
+    
+    except Exception as e:
+        logger.error(f"❌ Enhanced interview evaluation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Enhanced evaluation failed: {str(e)}")
 
 
 async def get_interview_ai_evaluation(
@@ -1642,123 +1728,284 @@ def format_fillers_for_prompt(fillers: List) -> str:
     return "\n".join([f"- '{word}': {count} times" for word, count in filler_summary.items()])
 
 def create_enhanced_fallback_evaluation(transcript: str, analysis: Dict, question: str) -> InterviewEvaluationResponse:
-    """Create an enhanced fallback evaluation when AI fails - using 1-10 scale with standard criteria"""
-    # Generate basic scores based on metrics (1-10 scale)
-    content_score = min(10, max(1, 6 + (len(transcript.split()) - 50) // 15))  # More words = better content, default to 6
+    """Create an enhanced fallback evaluation when AI fails - using 1-10 scale with intelligent tip generation"""
+    word_count = analysis.get('word_count', len(transcript.split()))
+    
+    # Generate basic scores based on metrics (1-10 scale) with better variability
+    content_score = calculate_intelligent_content_score(transcript, analysis, question)
     
     # Coherence score based on analysis
-    coherence_score = analysis.get('coherence_analysis', {}).get('coherence_score', 8)  # Default to 8 instead of 7
+    coherence_score = analysis.get('coherence_analysis', {}).get('coherence_score', 8)
     
     # Communication clarity based on filler count and speaking rate
-    filler_penalty = min(3, analysis.get("filler_count", 0) // 2)  # Penalty for fillers
+    filler_penalty = min(3, analysis.get("filler_count", 0) // 2)
     rate_penalty = 0
     wpm = analysis.get("speaking_rate_wpm", 150)
     if wpm < 100 or wpm > 180:
         rate_penalty = 1
-    clarity_score = max(1, min(10, 9 - filler_penalty - rate_penalty))  # Default higher
+    clarity_score = max(1, min(10, 9 - filler_penalty - rate_penalty))
     
-    # Delivery confidence score - default to good score
-    confidence_score = 8  # Default to 8/10 for confidence
+    # Delivery confidence score - varied based on analysis
+    confidence_score = calculate_confidence_score(analysis)
     
     # Language consistency score
-    language_score = analysis.get('language_analysis', {}).get('multilingual_score', 9)  # Default to 9 for single language
+    language_score = analysis.get('language_analysis', {}).get('multilingual_score', 9)
     
     # Calculate overall score
     overall_score = (content_score + coherence_score + clarity_score + confidence_score + language_score) / 5
     
-    # Ensure overall score is reasonable (6-9 range for fallback)
-    overall_score = max(6.0, min(9.0, overall_score))
+    # Ensure overall score is reasonable but varied (5-9 range)
+    overall_score = max(5.0, min(9.0, overall_score))
     
-    # Generate actionable tips based on analysis
-    tips = []
-    
-    # Content tip
-    if content_score < 6:
-        tips.append(ActionableTip(
-            title="Expand Content Depth",
-            description=f"Your response contained {analysis.get('word_count', 0)} words. Add specific examples and details to strengthen your answer.",
-            timestamp_ranges=[],
-            priority=1
-        ))
-    
-    # Filler words tip
-    if analysis.get('filler_count', 0) > 3:
-        tips.append(ActionableTip(
-            title="Reduce Filler Words",
-            description=f"Detected {analysis.get('filler_count', 0)} filler words. Practice pausing instead of using 'um', 'uh', etc.",
-            timestamp_ranges=[],
-            priority=2
-        ))
-    
-    # Coherence tip
-    coherence_issues = analysis.get('coherence_analysis', {}).get('coherence_issues', [])
-    if coherence_issues:
-        tips.append(ActionableTip(
-            title="Improve Logical Flow",
-            description=f"Coherence issues detected: {'; '.join(coherence_issues[:2])}",
-            timestamp_ranges=[],
-            priority=3
-        ))
-    
-    # Language consistency tip
-    if analysis.get('language_analysis', {}).get('is_multilingual', False):
-        detected_langs = analysis.get('language_analysis', {}).get('detected_languages', [])
-        tips.append(ActionableTip(
-            title="Maintain Language Consistency",
-            description=f"Multiple languages detected: {', '.join(detected_langs)}. Stick to one language throughout.",
-            timestamp_ranges=[],
-            priority=4
-        ))
-    
-    # Repetition tip
-    repetition_score = analysis.get('repetition_analysis', {}).get('repetition_score', 10)
-    if repetition_score < 7:
-        tips.append(ActionableTip(
-            title="Avoid Repetition",
-            description="Excessive word/phrase repetition detected. Use synonyms and vary your expression.",
-            timestamp_ranges=[],
-            priority=5
-        ))
+    # Generate intelligent actionable tips with deduplication
+    tips = generate_intelligent_tips(transcript, analysis, question)
     
     return InterviewEvaluationResponse(
         scores=[
             CriterionScore(
                 criterion="content_quality",
-                score=content_score,
-                feedback=f"Content depth assessment based on {analysis.get('word_count', 0)} words. Add more specific examples and details.",
+                score=int(content_score),
+                feedback=generate_content_feedback(content_score, word_count, question),
                 transcript_references=[]
             ),
             CriterionScore(
                 criterion="coherence_flow",
-                score=coherence_score,
-                feedback=f"Logical organization score: {coherence_score}/10. Work on clear structure and transitions.",
+                score=int(coherence_score),
+                feedback=generate_coherence_feedback(coherence_score, analysis),
                 transcript_references=[]
             ),
             CriterionScore(
                 criterion="communication_clarity", 
                 score=clarity_score,
-                feedback=f"Clarity assessment. {analysis.get('filler_count', 0)} fillers detected, speaking rate: {analysis.get('speaking_rate_wpm', 0):.1f} WPM.",
+                feedback=generate_clarity_feedback(clarity_score, analysis),
                 transcript_references=[]
             ),
             CriterionScore(
                 criterion="delivery_confidence",
                 score=confidence_score,
-                feedback=f"Overall delivery clarity score: {confidence_score}/10. Focus on confident, clear speech.",
+                feedback=generate_confidence_feedback(confidence_score, analysis),
                 transcript_references=[]
             ),
             CriterionScore(
                 criterion="language_consistency",
                 score=language_score,
-                feedback=f"Language consistency score: {language_score}/10. Maintain single language use.",
+                feedback=generate_language_feedback(language_score, analysis),
                 transcript_references=[]
             )
         ],
         overall_score=round(overall_score, 1),
-        actionable_tips=tips[:4],  # Limit to top 4 tips
+        actionable_tips=tips,
         transcript=transcript,
         speech_analysis=analysis,
         duration_seconds=analysis.get("total_duration", 0)
     )
+
+
+def calculate_intelligent_content_score(transcript: str, analysis: Dict, question: str) -> float:
+    """Calculate content score based on multiple factors, not just word count"""
+    word_count = analysis.get('word_count', len(transcript.split()))
+    
+    # Base score from word count (but less linear)
+    if word_count < 20:
+        base_score = 3
+    elif word_count < 50:
+        base_score = 5
+    elif word_count < 100:
+        base_score = 7
+    elif word_count < 200:
+        base_score = 8
+    else:
+        base_score = 9
+    
+    # Adjust based on content quality indicators
+    adjustments = 0
+    
+    # Check for specific examples
+    example_keywords = ['for example', 'such as', 'like when', 'in my experience', 'specifically']
+    if any(keyword in transcript.lower() for keyword in example_keywords):
+        adjustments += 0.5
+    
+    # Check for structured thinking
+    structure_keywords = ['first', 'second', 'finally', 'in conclusion', 'moreover', 'however']
+    structure_count = sum(1 for keyword in structure_keywords if keyword in transcript.lower())
+    adjustments += min(1.0, structure_count * 0.3)
+    
+    # Penalize very repetitive content
+    repetition_score = analysis.get('repetition_analysis', {}).get('repetition_score', 8)
+    if repetition_score < 5:
+        adjustments -= 1
+    
+    # Question relevance (simple keyword matching)
+    if question:
+        question_words = set(question.lower().split())
+        transcript_words = set(transcript.lower().split())
+        overlap = len(question_words.intersection(transcript_words))
+        if overlap > 2:
+            adjustments += 0.5
+    
+    final_score = max(1, min(10, base_score + adjustments))
+    return round(final_score, 1)
+
+
+def calculate_confidence_score(analysis: Dict) -> float:
+    """Calculate confidence score based on speech patterns"""
+    base_score = 8.0
+    
+    # Reduce score for excessive pauses
+    long_pauses = len(analysis.get('long_pauses', []))
+    if long_pauses > 3:
+        base_score -= min(2, long_pauses * 0.5)
+    
+    # Reduce score for high filler density
+    filler_density = analysis.get('filler_density', {}).get('overall_density', 0)
+    if filler_density > 0.15:
+        base_score -= 2
+    elif filler_density > 0.10:
+        base_score -= 1
+    
+    # Speaking rate impact
+    wpm = analysis.get('speaking_rate_wpm', 150)
+    if wpm < 80:  # Very slow might indicate uncertainty
+        base_score -= 1
+    elif wpm > 200:  # Very fast might indicate nervousness
+        base_score -= 0.5
+    
+    return max(1, min(10, base_score))
+
+
+def generate_intelligent_tips(transcript: str, analysis: Dict, question: str) -> List[ActionableTip]:
+    """Generate intelligent, non-repetitive actionable tips"""
+    tips = []
+    word_count = analysis.get('word_count', len(transcript.split()))
+    
+    # Priority 1: Critical issues
+    if word_count < 30:
+        tips.append(ActionableTip(
+            title="Provide More Detailed Responses",
+            description=f"Your response was quite brief ({word_count} words). Elaborate with specific examples and detailed explanations.",
+            timestamp_ranges=[],
+            priority=1
+        ))
+    
+    # Priority 2: High-impact improvements
+    filler_count = analysis.get('filler_count', 0)
+    if filler_count > 5 and word_count > 0:
+        filler_ratio = filler_count / word_count
+        if filler_ratio > 0.1:  # More than 10% fillers
+            tips.append(ActionableTip(
+                title="Reduce Verbal Hesitations",
+                description=f"High filler word usage detected ({filler_count} fillers). Practice strategic pauses instead of 'um', 'uh', 'like'.",
+                timestamp_ranges=[],
+                priority=2
+            ))
+    
+    # Priority 3: Structure and flow
+    coherence_issues = analysis.get('coherence_analysis', {}).get('coherence_issues', [])
+    if coherence_issues and len(coherence_issues) > 0:
+        tips.append(ActionableTip(
+            title="Enhance Logical Structure",
+            description=f"Improve organization: {coherence_issues[0]}. Use transition words to connect ideas clearly.",
+            timestamp_ranges=[],
+            priority=3
+        ))
+    
+    # Compressed: priorities >3 must map into 1-3 (model constraint priority<=3)
+    # Priority 3 (content depth & advanced improvements grouped below)
+    if word_count >= 30 and word_count < 80:  # Medium length responses
+        if not any('example' in transcript.lower() or 'specifically' in transcript.lower() for _ in [1]):
+            tips.append(ActionableTip(
+                title="Add Concrete Examples",
+                description="Strengthen your answer with specific examples or personal experiences to demonstrate your points.",
+                timestamp_ranges=[],
+        priority=3
+            ))
+    
+    # Advanced improvement: repetition (mapped to priority 3)
+    repetition_issues = analysis.get('repetition_analysis', {}).get('repetition_issues', [])
+    if repetition_issues:
+        tips.append(ActionableTip(
+            title="Diversify Vocabulary",
+            description=f"Avoid repetition: {repetition_issues[0]}. Use synonyms and varied expressions.",
+            timestamp_ranges=[],
+        priority=3
+        ))
+    
+    # Language consistency (mapped to priority 3)
+    if analysis.get('language_analysis', {}).get('is_multilingual', False):
+        detected_langs = analysis.get('language_analysis', {}).get('detected_languages', [])
+        tips.append(ActionableTip(
+            title="Maintain Language Consistency",
+            description=f"Multiple languages detected: {', '.join(detected_langs[:2])}. Stick to one language throughout your response.",
+            timestamp_ranges=[],
+        priority=3
+        ))
+    
+    # Limit to top 3 most relevant tips to avoid overwhelming
+    return tips[:3]
+
+
+def generate_content_feedback(score: float, word_count: int, question: str) -> str:
+    """Generate varied content feedback based on score"""
+    if score >= 8:
+        return f"Excellent content depth with {word_count} words. Well-structured and comprehensive response."
+    elif score >= 6:
+        return f"Good content foundation with {word_count} words. Consider adding more specific examples to strengthen your points."
+    elif score >= 4:
+        return f"Basic content provided ({word_count} words). Expand with detailed explanations and concrete examples."
+    else:
+        return f"Content needs significant development ({word_count} words). Provide more comprehensive answers with supporting details."
+
+
+def generate_coherence_feedback(score: float, analysis: Dict) -> str:
+    """Generate coherence-specific feedback"""
+    issues = analysis.get('coherence_analysis', {}).get('coherence_issues', [])
+    
+    if score >= 8:
+        return "Excellent logical flow and organization. Ideas are well-connected and easy to follow."
+    elif score >= 6:
+        if issues:
+            return f"Good structure overall. Minor improvement: {issues[0]}."
+        return "Good organization with clear logical progression."
+    else:
+        if issues:
+            return f"Needs better organization. Focus on: {'; '.join(issues[:2])}."
+        return "Improve logical flow by using transition words and organizing ideas more clearly."
+
+
+def generate_clarity_feedback(score: float, analysis: Dict) -> str:
+    """Generate clarity-specific feedback"""
+    filler_count = analysis.get('filler_count', 0)
+    wpm = analysis.get('speaking_rate_wpm', 150)
+    
+    if score >= 8:
+        return f"Clear and confident delivery. Speaking rate: {wpm:.0f} WPM, minimal fillers."
+    elif score >= 6:
+        return f"Generally clear communication. {filler_count} filler words detected, speaking rate: {wpm:.0f} WPM."
+    else:
+        return f"Work on clarity: {filler_count} fillers detected, speaking rate: {wpm:.0f} WPM. Practice deliberate speech."
+
+
+def generate_confidence_feedback(score: float, analysis: Dict) -> str:
+    """Generate confidence-specific feedback"""
+    pauses = len(analysis.get('long_pauses', []))
+    
+    if score >= 8:
+        return "Strong, confident delivery with good pacing and minimal hesitation."
+    elif score >= 6:
+        return f"Generally confident presentation. {pauses} long pauses detected - practice for smoother delivery."
+    else:
+        return f"Build confidence in delivery. {pauses} significant pauses detected. Practice will improve fluency."
+
+
+def generate_language_feedback(score: float, analysis: Dict) -> str:
+    """Generate language consistency feedback"""
+    if score >= 9:
+        return "Excellent language consistency throughout the response."
+    else:
+        multilingual = analysis.get('language_analysis', {}).get('is_multilingual', False)
+        if multilingual:
+            return "Multiple languages detected. Maintain consistency in one language for professional communication."
+        return "Good language consistency with minor variations."
 
 def create_fallback_evaluation(transcript: str, analysis: Dict) -> InterviewEvaluationResponse:
     """Create a basic evaluation when AI fails"""
@@ -2140,3 +2387,253 @@ async def get_interview_prompts(category: str):
         raise HTTPException(status_code=404, detail="Category not found")
     
     return {"prompts": prompts[category.lower()]}
+
+
+@router.post("/audio/speaker-detection")
+async def detect_speakers_in_audio(
+    audio_uuid: str,
+    max_duration: int = 120
+):
+    """
+    Detect number of speakers in an audio recording using speaker diarization
+    
+    Args:
+        audio_uuid: UUID of the uploaded audio file
+        max_duration: Maximum duration to process (seconds) for efficiency
+    
+    Returns:
+        Speaker information including count, segments, and statistics
+    """
+    try:
+        from api.utils.audio import speaker_service
+        
+        # Download audio file
+        if settings.s3_folder_name:
+            audio_data = download_file_from_s3_as_bytes(
+                get_media_upload_s3_key_from_uuid(audio_uuid, "wav")
+            )
+        else:
+            audio_file_path = os.path.join(settings.local_upload_folder, f"{audio_uuid}.wav")
+            if not os.path.exists(audio_file_path):
+                raise HTTPException(status_code=404, detail="Audio file not found")
+            
+            with open(audio_file_path, "rb") as f:
+                audio_data = f.read()
+        
+        # Perform speaker detection (Google diarization if available, otherwise heuristic fallback)
+        speaker_info = speaker_service.detect_speakers(audio_data)
+
+        return {
+            "success": True,
+            "audio_uuid": audio_uuid,
+            "speaker_detection": speaker_info,
+            "processing_info": {
+                "max_duration_processed": max_duration,
+                "diarization_available": speaker_service.is_available,
+                "method_used": speaker_info.get("method", "unknown")
+            }
+        }
+        
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    except Exception as e:
+        logger.error(f"Error in speaker detection: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Speaker detection failed: {str(e)}")
+
+
+async def get_enhanced_interview_ai_evaluation(
+    question: str,
+    transcript: str,
+    speech_analysis: dict,
+    speaker_analysis: dict,
+    max_duration: int
+) -> InterviewEvaluationResponse:
+    """Get AI evaluation using enhanced transcript and speaker data"""
+    
+    try:
+        # Calculate intelligent scores using enhanced data
+        content_score = calculate_intelligent_content_score(transcript, speech_analysis, question)
+        
+        # Generate intelligent tips with deduplication
+        actionable_tips = generate_intelligent_tips(transcript, speech_analysis, speaker_analysis, question)
+        
+        # Create enhanced rubric scores
+        scores = [
+            CriterionScore(
+                criterion="content_quality",
+                score=int(content_score),
+                feedback=f"Content demonstrates {'excellent' if content_score >= 8 else 'good' if content_score >= 6 else 'adequate'} depth and relevance.",
+                transcript_references=[]
+            ),
+            CriterionScore(
+                criterion="communication_clarity",
+                score=int(max(1, min(5, 6 - speech_analysis.get('filler_count', 0) // 3))),
+                feedback=f"Speech clarity is {'excellent' if speech_analysis.get('filler_count', 0) < 3 else 'good' if speech_analysis.get('filler_count', 0) < 6 else 'needs improvement'}.",
+                transcript_references=[]
+            ),
+            CriterionScore(
+                criterion="structure_organization",
+                score=int(max(1, min(5, content_score * 0.8))),
+                feedback="Response structure and organization demonstrates clear thinking.",
+                transcript_references=[]
+            )
+        ]
+        
+        # Add speaker-specific scoring if multiple speakers detected
+        if speaker_analysis.get('is_multi_speaker', False):
+            scores.append(CriterionScore(
+                criterion="speaker_management",
+                score=int(max(1, min(5, 4 - speaker_analysis.get('num_speakers', 1)))),
+                feedback=f"Multiple speakers detected ({speaker_analysis.get('num_speakers', 1)}). Consider individual recordings for optimal evaluation.",
+                transcript_references=[]
+            ))
+        
+        # Calculate overall score
+        overall_score = sum(score.score for score in scores) / len(scores)
+        
+        return InterviewEvaluationResponse(
+            scores=scores,
+            overall_score=overall_score,
+            actionable_tips=actionable_tips,
+            transcript=transcript,
+            speech_analysis=speech_analysis,
+            speaker_analysis=speaker_analysis,
+            duration_seconds=speech_analysis.get('total_duration', 0)
+        )
+    
+    except Exception as e:
+        logger.error(f"Enhanced evaluation failed: {str(e)}")
+        # Fallback to regular evaluation
+        return create_enhanced_fallback_evaluation(transcript, speech_analysis, question)
+
+
+@router.post("/audio/enhanced-evaluation-with-speakers")
+async def get_enhanced_audio_evaluation_with_speakers(
+    audio_uuid: str,
+    question: Optional[str] = None,
+    max_duration: int = 60,
+    user_id: Optional[str] = None
+):
+    """
+    Get comprehensive audio evaluation including speaker diarization
+    
+    This endpoint combines transcription, speech analysis, speaker detection,
+    and full interview evaluation for the most complete assessment.
+    """
+    try:
+        # Download audio file
+        if settings.s3_folder_name:
+            audio_data = download_file_from_s3_as_bytes(
+                get_media_upload_s3_key_from_uuid(audio_uuid, "wav")
+            )
+        else:
+            audio_file_path = os.path.join(settings.local_upload_folder, f"{audio_uuid}.wav")
+            if not os.path.exists(audio_file_path):
+                raise HTTPException(status_code=404, detail="Audio file not found")
+            
+            with open(audio_file_path, "rb") as f:
+                audio_data = f.read()
+        
+        # Get enhanced transcription with speaker analysis
+        from api.utils.audio import enhanced_audio_service
+        
+        # First get transcription (with optional speaker analysis behind feature flag)
+        if getattr(settings, 'enable_speaker_diarization', False):
+            enhanced_result = enhanced_audio_service.transcribe_with_speaker_analysis(audio_data)
+        else:
+            # Use basic transcription path (simulate structure of enhanced_result)
+            base = audio_service.transcribe_with_analysis(audio_data)
+            if "error" in base:
+                enhanced_result = base
+            else:
+                enhanced_result = base | {"speaker_analysis": {"is_multi_speaker": False, "num_speakers": 1, "method": "disabled"}}
+        
+        if "error" in enhanced_result:
+            logger.warning(f"Enhanced processing failed: {enhanced_result['error']}, using fallback")
+            # Fall back to regular evaluation
+            evaluation = await get_interview_ai_evaluation(
+                question=question or "Interview question",
+                audio_data=audio_data,
+                max_duration=max_duration
+            )
+        else:
+            # Use the enhanced transcript and analysis for the evaluation
+            transcript = enhanced_result["transcript"]
+            speech_analysis = enhanced_result["analysis"]
+            speaker_analysis = enhanced_result.get("speaker_analysis", {})
+            
+            # Get full AI evaluation with enhanced data
+            evaluation = await get_enhanced_interview_ai_evaluation(
+                question=question or "Interview question",
+                transcript=transcript,
+                speech_analysis=speech_analysis,
+                speaker_analysis=speaker_analysis,
+                max_duration=max_duration
+            )
+        
+        return evaluation
+        
+    except Exception as e:
+        logger.error(f"Error in enhanced audio evaluation: {str(e)}")
+        # Fall back to regular evaluation
+        try:
+            evaluation = await get_interview_ai_evaluation(
+                question=question or "Interview question",
+                audio_data=audio_data,
+                max_duration=max_duration
+            )
+            return evaluation
+        except Exception as fallback_error:
+            logger.error(f"Fallback evaluation also failed: {str(fallback_error)}")
+            raise HTTPException(status_code=500, detail=str(e))
+        
+        # Add context-aware recommendations
+        if question:
+            response["question_context"] = question
+            
+        if context:
+            response["additional_context"] = context
+        
+        # Generate actionable recommendations based on analysis
+        recommendations = []
+        
+        # Speaker-based recommendations
+        speaker_feedback = result.get("analysis", {}).get("speaker_feedback", {})
+        if speaker_feedback.get("recommendations"):
+            recommendations.extend(speaker_feedback["recommendations"])
+        
+        # Speech quality recommendations
+        analysis = result.get("analysis", {})
+        clarity_score = analysis.get("overall_clarity_score", 10)
+        
+        if clarity_score < 6:
+            recommendations.append({
+                "type": "clarity_improvement",
+                "title": "Improve Speech Clarity",
+                "description": f"Overall clarity score: {clarity_score}/10. Focus on reducing filler words and improving coherence.",
+                "priority": "high"
+            })
+        
+        filler_count = analysis.get("filler_count", 0)
+        word_count = analysis.get("word_count", 1)
+        filler_ratio = filler_count / word_count if word_count > 0 else 0
+        
+        if filler_ratio > 0.15:  # More than 15% filler words
+            recommendations.append({
+                "type": "reduce_fillers",
+                "title": "Reduce Filler Words",
+                "description": f"High filler word usage detected ({filler_count} fillers in {word_count} words). Practice speaking more deliberately.",
+                "priority": "medium"
+            })
+        
+        response["recommendations"] = recommendations
+        
+        return response
+        
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    except Exception as e:
+        logger.error(f"Error in enhanced audio evaluation: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Enhanced evaluation failed: {str(e)}")
+
+

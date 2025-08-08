@@ -15,6 +15,13 @@ if os.path.exists(env_path):
 class Settings(BaseSettings):
     google_client_id: str
     openai_api_key: str
+    # Google Cloud Speech V2 diarization settings (optional)
+    gcp_project_id: str | None = None
+    gcp_location: str | None = None
+    gcp_recognizer_id: str | None = None
+    # Feature flags
+    enable_speaker_diarization: bool = False
+    assemblyai_api_key: str | None = None
     s3_bucket_name: str | None = None  # only relevant when running the code remotely
     s3_folder_name: str | None = None  # only relevant when running the code remotely
     local_upload_folder: str = (

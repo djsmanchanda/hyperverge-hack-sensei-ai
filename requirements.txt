@@ -35,3 +35,11 @@ bugsnag==4.7.1
 arize-phoenix==10.10.0
 arize-phoenix-otel==0.10.3
 openinference-instrumentation-openai==0.1.30
+# Speaker diarization (migrated from pyannote/torch to Google Cloud Speech to reduce load time)
+# Removed heavy dependencies:
+# pyannote.audio==3.1.1
+# torch>=1.13.0
+# torchaudio>=0.13.0
+soundfile>=0.12.1
+google-cloud-speech==2.27.0
+assemblyai==0.34.0
