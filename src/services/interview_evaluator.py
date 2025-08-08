@@ -1,12 +1,11 @@
 from typing import Dict, List
 import json
-from .transcription_service import TranscriptionService
 from ..models.interview_rubric import InterviewRubric, InterviewEvaluation, CriterionScore, ActionableTip, RubricCriterion
-from ..llm.llm_service import LLMService
+from ..llm_service import LLMService
+from api.utils.audio import audio_service
 
 class InterviewEvaluator:
     def __init__(self):
-        self.transcription_service = TranscriptionService()
         self.rubric = InterviewRubric.get_default_rubric()
         self.llm_service = LLMService()
     
@@ -18,14 +17,28 @@ class InterviewEvaluator:
     ) -> InterviewEvaluation:
         """Complete evaluation pipeline for audio interview response"""
         
-        # 1. Transcribe with timestamps
-        transcription = self.transcription_service.transcribe_with_timestamps(audio_file_path)
-        
-        # 2. Detect fillers and speech patterns
-        fillers = self.transcription_service.detect_fillers(transcription["words"])
-        
-        # 3. Analyze duration and pacing
-        duration_analysis = self._analyze_duration_and_pacing(transcription)
+        # 1. Load bytes & transcribe via OpenAI API wrapper (audio_service)
+        with open(audio_file_path, 'rb') as f:
+            audio_bytes = f.read()
+        trans_res = audio_service.transcribe_with_analysis(audio_bytes)
+        if trans_res.get('error'):
+            raise ValueError(f"Transcription failed: {trans_res['error']}")
+
+        transcription = {
+            'text': trans_res.get('transcript', ''),
+            'segments': trans_res.get('segments', []),
+            'words': []  # not available from current wrapper
+        }
+        analysis = trans_res.get('analysis', {})
+        fillers = analysis.get('fillers', [])
+        duration_analysis = {
+            'total_duration': analysis.get('total_duration', 0),
+            'word_count': analysis.get('word_count', 0),
+            'words_per_minute': analysis.get('speaking_rate_wpm', 0),
+            'long_pauses': analysis.get('long_pauses', []),
+            'target_duration': self.rubric.max_duration,
+            'duration_score': self._score_duration(analysis.get('total_duration', 0))
+        }
         
         # 4. Get AI evaluation using enhanced prompt
         ai_evaluation = await self._get_ai_evaluation(
@@ -45,13 +58,27 @@ class InterviewEvaluator:
             duration_analysis
         )
         
-        # 6. Create final evaluation
+        # 6. Generate vocal delivery focused feedback list (JSON array of strings)
+        vocal_feedback = await self._generate_vocal_feedback(
+            transcription=transcription,
+            fillers=fillers,
+            duration_analysis=duration_analysis
+        )
+
+        # 7. Determine follow-up question if answer weak
+        follow_up_question = self._maybe_follow_up(ai_evaluation)
+
+        # 8. Create final evaluation enriched
         return InterviewEvaluation(
             scores=ai_evaluation["scores"],
             overall_score=ai_evaluation["overall_score"],
             actionable_tips=actionable_tips,
             transcript_highlights=self._highlight_transcript_issues(transcription, fillers),
-            duration_analysis=duration_analysis
+            duration_analysis=duration_analysis,
+            strengths=ai_evaluation.get("strengths", []),
+            areas_for_improvement=ai_evaluation.get("areas_for_improvement", []),
+            vocal_feedback=vocal_feedback,
+            follow_up_question=follow_up_question
         )
     
     def _analyze_duration_and_pacing(self, transcription: Dict) -> Dict:
@@ -128,7 +155,6 @@ FILLER ANALYSIS:
 {self._format_fillers_for_prompt(fillers)}
 
 Provide scores and specific feedback for each criterion. Reference specific parts of the transcript when giving feedback."""
-
         response = await self.llm_service.get_structured_response(
             system_prompt=system_prompt,
             user_message="Evaluate this interview response according to the rubric.",
@@ -146,7 +172,6 @@ Provide scores and specific feedback for each criterion. Reference specific part
                 "areas_for_improvement": ["array"]
             }
         )
-        
         return response
     
     def _format_fillers_for_prompt(self, fillers: List) -> str:
@@ -238,3 +263,45 @@ Provide scores and specific feedback for each criterion. Reference specific part
             })
         
         return highlights
+
+    async def _generate_vocal_feedback(self, transcription: Dict, fillers: List, duration_analysis: Dict) -> List[str]:
+        """Generate up to 5 specific vocal delivery feedback points as JSON array strings."""
+        system_prompt = """You are an expert vocal coach. You will be given transcript text (without timestamps here), filler data, and pacing stats. Produce 3-5 concise, constructive feedback points focusing ONLY on: Pace & Rhythm, Tone & Intonation, Clarity & Articulation, Filler Words usage, Volume/Projection (infer from clarity & pacing), and Pauses. Each point must: (a) Name the aspect, (b) Describe observed behavior, (c) Provide one actionable improvement suggestion, (d) Be encouraging. Return ONLY a JSON array of strings. No extra text."""
+
+        filler_summary = self._format_fillers_for_prompt(fillers)
+        user_message = (
+            f"TRANSCRIPT:\n{transcription['text']}\n\n"
+            f"DURATION: {duration_analysis['total_duration']:.1f}s | WPM: {duration_analysis['words_per_minute']:.1f} | LONG_PAUSES: {len(duration_analysis['long_pauses'])}\n"
+            f"FILLERS:\n{filler_summary}\n"
+            "Return JSON array now."
+        )
+        try:
+            response = await self.llm_service.get_structured_response(
+                system_prompt=system_prompt,
+                user_message=user_message,
+                response_format={"feedback": ["array of feedback strings"]}
+            )
+            # Accept either direct array or object wrapper
+            if isinstance(response, list):
+                return response[:5]
+            if isinstance(response, dict):
+                # heuristic: find first list value
+                for v in response.values():
+                    if isinstance(v, list):
+                        return [str(x) for x in v][:5]
+        except Exception:
+            pass
+        return []
+
+    def _maybe_follow_up(self, ai_eval: Dict) -> str | None:
+        """If overall or any key criterion weak, craft a follow-up coaching question."""
+        overall = ai_eval.get("overall_score", 0)
+        scores = ai_eval.get("scores", [])
+        weak = [s for s in scores if s.get("score", 0) <= 2]
+        if overall < 3 or weak:
+            # target weakest criterion name(s)
+            weak_names = ", ".join({s.get("criterion","") for s in weak}) or "areas above"
+            return (
+                f"Great effort. Let's refine your {weak_names}. Could you try again focusing on a clear core definition early, reducing fillers, and tightening structure?"
+            )
+        return None

@@ -318,6 +318,22 @@ class DraftQuestion(BaseModel):
     title: str
 
 
+# Variant used only for AI chat previews (when a question isn't yet persisted).
+# Title is optional here to avoid 422 errors during ad-hoc evaluation before a
+# question is fully created. Persisted questions should continue to use
+# DraftQuestion with mandatory title to satisfy DB NOT NULL constraint.
+class DraftQuestionForChat(BaseModel):
+    blocks: List[Block]
+    answer: List[Block] | None
+    type: QuestionType
+    input_type: TaskInputType
+    response_type: TaskAIResponseType
+    context: Dict | None
+    coding_languages: List[str] | None
+    scorecard_id: Optional[int] = None
+    title: Optional[str] = "Preview Question"
+
+
 class PublishedQuestion(DraftQuestion):
     id: int
     scorecard_id: Optional[int] = None
@@ -643,7 +659,8 @@ class UserCohort(BaseModel):
 class AIChatRequest(BaseModel):
     user_response: str
     task_type: TaskType
-    question: Optional[DraftQuestion] = None
+    # Allow preview questions without mandatory title via DraftQuestionForChat
+    question: Optional[DraftQuestionForChat] = None
     chat_history: Optional[List[Dict]] = None
     question_id: Optional[int] = None
     user_id: int

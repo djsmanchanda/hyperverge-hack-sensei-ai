@@ -1,10 +1,12 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
+import json
 from pydantic import BaseModel
 from typing import Optional
 import tempfile
 import os
 from ..services.interview_evaluator import InterviewEvaluator
 from ..models.interview_rubric import InterviewEvaluation
+from api.utils.audio import audio_service
 
 router = APIRouter(prefix="/interview", tags=["interview"])
 
@@ -49,8 +51,11 @@ async def evaluate_audio_interview(
             context=context_dict
         )
         
-        # Get transcript for response
-        transcription = evaluator.transcription_service.transcribe_with_timestamps(temp_file_path)
+        # Get transcript for response (re-run minimal transcription for display)
+        with open(temp_file_path, 'rb') as f:
+            _bytes = f.read()
+        _trans = audio_service.transcribe_with_analysis(_bytes)
+        transcription = {"text": _trans.get("transcript", "")}
         
         return InterviewResponse(
             evaluation=evaluation,

@@ -32,6 +32,11 @@ class InterviewEvaluation(BaseModel):
     actionable_tips: List[ActionableTip]
     transcript_highlights: List[Dict] = Field(default_factory=list)
     duration_analysis: Dict = Field(default_factory=dict)
+    # Newly added enriched feedback fields
+    strengths: List[str] = Field(default_factory=list)
+    areas_for_improvement: List[str] = Field(default_factory=list)
+    vocal_feedback: List[str] = Field(default_factory=list)  # Up to 5 vocal coaching points
+    follow_up_question: Optional[str] = None  # If answer unsatisfactory, prompt user to retry focusing on weaknesses
 
 class InterviewRubric(BaseModel):
     criteria: Dict[RubricCriterion, List[ScoreLevel]]

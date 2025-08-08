@@ -1,4 +1,3 @@
-from ast import List
 import os
 import tempfile
 import random
@@ -48,14 +47,15 @@ from api.db.task import (
 )
 from api.db.course import (
     store_course_generation_request,
+    get_course_generation_job_details,
+    update_course_generation_job_status_and_details,
+    update_course_generation_job_status,
+    get_all_pending_course_structure_generation_jobs,
     add_milestone_to_course,
-)
-from api.db.probing import (
-    create_probing_session,
-    update_probing_session_with_question,
-    update_probing_session_with_response,
-    create_understanding_certification,
-    get_probing_session,
+    get_all_pending_course_structure_generation_jobs,
+    update_course_generation_job_status_and_details,
+    update_course_generation_job_status,
+    get_course_generation_job_details,
 )
 from api.db.chat import get_question_chat_history_for_user
 from api.db.utils import construct_description_from_blocks
@@ -70,6 +70,59 @@ from openinference.instrumentation import using_attributes
 
 router = APIRouter()
 
+# Debug utilities
+@router.get("/debug")
+async def debug_endpoint():
+    """Debug endpoint to verify server is running updated code"""
+    from api.utils.logging import logger
+    logger.info("DEBUG: AI debug endpoint called - server is running updated code")
+    return {"status": "debug_active", "message": "Server is running updated code with enhanced logging"}
+
+
+@router.post("/test-validation")
+async def test_validation_endpoint(request: AIChatRequest):
+    """Test endpoint to trigger validation - should fail with missing fields"""
+    return {"status": "validation_passed", "user_id": request.user_id}
+
+# --------- Structured Logging Helpers (AI Chat) ---------
+def _safe_json(data):
+    try:
+        return json.dumps(data, default=str)[:10000]  # cap length
+    except Exception:
+        return str(data)
+
+
+def log_chat(stage: str, **fields):
+    """Central logging for /ai/chat pipeline; adds a consistent prefix.
+    Large fields are truncated to avoid gigantic log lines."""
+    payload = {k: v for k, v in fields.items() if v is not None}
+    # Truncate potentially huge fields
+    for key in list(payload.keys()):
+        if isinstance(payload[key], (str, bytes)) and len(payload[key]) > 500:
+            payload[key] = f"{payload[key][:500]}...[truncated]{len(payload[key])}"
+        if key in {"chat_history", "messages"}:
+            try:
+                payload[key] = f"list(len={len(payload[key])})"
+            except Exception:
+                pass
+    logger.info(f"[AI_CHAT] {stage} | {_safe_json(payload)}")
+
+# --------- Probing Session Stubs (to avoid runtime NameErrors) ---------
+async def get_probing_session(session_uuid: str):
+    return None
+
+async def create_probing_session(user_id, question_id, task_id, user_response):
+    return "session-stub"
+
+async def update_probing_session_with_question(session_uuid: str, question: str, question_type: str):
+    return None
+
+async def update_probing_session_with_response(session_uuid: str, user_response: str, understanding_demonstrated: bool, certification_ready: bool, mastery_level, concepts_mastered):
+    return None
+
+async def create_understanding_certification(user_id, question_id, task_id, session_uuid, mastery_level, concepts_mastered, probing_attempts: int):
+    return None
+
 
 def get_user_audio_message_for_chat_history(uuid: str) -> List[Dict]:
     if settings.s3_folder_name:
@@ -77,8 +130,21 @@ def get_user_audio_message_for_chat_history(uuid: str) -> List[Dict]:
             get_media_upload_s3_key_from_uuid(uuid, "wav")
         )
     else:
-        with open(os.path.join(settings.local_upload_folder, f"{uuid}.wav"), "rb") as f:
-            audio_data = f.read()
+        # Try common audio extensions (frontend may send different content-types)
+        tried_files = []
+        audio_data = None
+        for ext in ["wav", "mp3", "m4a", "webm", "ogg"]:
+            path = os.path.join(settings.local_upload_folder, f"{uuid}.{ext}")
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    audio_data = f.read()
+                break
+            tried_files.append(path)
+        if audio_data is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Audio file for uuid {uuid} not found in any of: {', '.join(tried_files)}",
+            )
 
     return [
         {
@@ -126,22 +192,81 @@ def get_user_message_for_chat_history(user_response: str) -> str:
 
 @router.post("/chat")
 async def ai_response_for_question(request: AIChatRequest):
+    # Add detailed logging for debugging
+    logger.info("=== AI CHAT REQUEST RECEIVED ===")
+    try:
+        logger.info("Raw request parsed into model successfully")
+        logger.info(f"payload.keys: {list(request.model_dump().keys())}")
+        logger.info(
+            f"user_id: {request.user_id} (type: {type(request.user_id)}), task_id: {request.task_id} (type: {type(request.task_id)})"
+        )
+        logger.info(
+            f"response_type: {request.response_type}, task_type: {request.task_type}, question_id: {request.question_id}"
+        )
+        logger.info(
+            f"user_response type: {type(request.user_response)}, length: {len(request.user_response) if request.user_response else 'None'}"
+        )
+        logger.info(
+            f"chat_history length: {len(request.chat_history) if request.chat_history else 0}, question provided: {'Yes' if request.question else 'No'}"
+        )
+    except Exception as e:
+        logger.error(f"Error logging request fields: {e}")
+    logger.info("================================")
+    
+    # Convert and validate required fields
+    logger.info(f"Validating required fields and coercing types")
+    if request.user_id is None:
+        logger.error("Missing user_id in request")
+        raise HTTPException(status_code=400, detail="user_id is required")
+    
+    if request.task_id is None:
+        logger.error("Missing task_id in request")
+        raise HTTPException(status_code=400, detail="task_id is required")
+    
+    # Convert string IDs to integers
+    try:
+        user_id = int(str(request.user_id))
+        task_id = int(str(request.task_id))
+    except (ValueError, TypeError) as e:
+        logger.error(f"Error converting IDs to integers: {e}")
+        raise HTTPException(status_code=400, detail="user_id and task_id must be valid integers")
+    
+    # Validate task_type
+    if request.task_type not in ["quiz", "learning_material"]:
+        logger.error(f"Invalid task_type: {request.task_type}")
+        raise HTTPException(status_code=400, detail="task_type must be 'quiz' or 'learning_material'")
+    
+    # Convert response_type to enum if provided
+    response_type = None
+    if request.response_type:
+        if request.response_type not in ["text", "code", "audio"]:
+            logger.error(f"Invalid response_type: {request.response_type}")
+            raise HTTPException(status_code=400, detail="response_type must be 'text', 'code', or 'audio'")
+        response_type = ChatResponseType(request.response_type)
+    
+    # Convert task_type to enum
+    task_type = TaskType(request.task_type)
+    
     metadata = {"task_id": request.task_id, "user_id": request.user_id}
+    log_chat("request_received", request=_safe_json(request.model_dump(exclude_none=True)))
 
     if request.task_type == TaskType.QUIZ:
         if request.question_id is None and request.question is None:
+            log_chat("validation_error", reason="missing_question_id_and_question")
             raise HTTPException(
                 status_code=400,
                 detail=f"Question ID or question is required for {request.task_type} tasks",
             )
 
         if request.question_id is not None and request.user_id is None:
+            log_chat("validation_error", reason="question_id_requires_user_id")
             raise HTTPException(
                 status_code=400,
                 detail="User ID is required when question ID is provided",
             )
 
         if request.question and request.chat_history is None:
+            log_chat("validation_error", reason="missing_chat_history_for_question_preview")
             raise HTTPException(
                 status_code=400,
                 detail="Chat history is required when question is provided",
@@ -154,12 +279,14 @@ async def ai_response_for_question(request: AIChatRequest):
             )
     else:
         if request.task_id is None:
+            log_chat("validation_error", reason="missing_task_id_for_learning_material")
             raise HTTPException(
                 status_code=400,
                 detail="Task ID is required for learning material tasks",
             )
 
         if request.chat_history is None:
+            log_chat("validation_error", reason="missing_chat_history_for_learning_material")
             raise HTTPException(
                 status_code=400,
                 detail="Chat history is required for learning material tasks",
@@ -170,6 +297,7 @@ async def ai_response_for_question(request: AIChatRequest):
         metadata["type"] = "learning_material"
         task = await get_task(request.task_id)
         if not task:
+            log_chat("task_not_found", task_id=request.task_id)
             raise HTTPException(status_code=404, detail="Task not found")
 
         chat_history = request.chat_history
@@ -182,6 +310,7 @@ async def ai_response_for_question(request: AIChatRequest):
         if request.question_id:
             question = await get_question(request.question_id)
             if not question:
+                log_chat("question_not_found", question_id=request.question_id)
                 raise HTTPException(status_code=404, detail="Question not found")
 
             metadata["question_id"] = request.question_id
@@ -195,6 +324,9 @@ async def ai_response_for_question(request: AIChatRequest):
             ]
         else:
             question = request.question.model_dump()
+            # Ensure a title for downstream logic / logging
+            if not question.get("title"):
+                question["title"] = "Preview Question"
             chat_history = request.chat_history
 
             question["scorecard"] = await get_scorecard(question["scorecard_id"])
@@ -214,8 +346,9 @@ async def ai_response_for_question(request: AIChatRequest):
     task_metadata = await get_task_metadata(request.task_id)
     if task_metadata:
         metadata.update(task_metadata)
+    log_chat("metadata_assembled", metadata=metadata)
 
-    for message in chat_history:
+    for idx, message in enumerate(chat_history):
         if message["role"] == "user":
             if request.response_type == ChatResponseType.AUDIO:
                 message["content"] = get_user_audio_message_for_chat_history(
@@ -230,6 +363,10 @@ async def ai_response_for_question(request: AIChatRequest):
                 message["content"] = json.dumps({"feedback": message["content"]})
 
             message["content"] = get_ai_message_for_chat_history(message["content"])
+        if idx < 5:  # avoid flooding logs - first few only
+            log_chat("chat_history_message_transformed", index=idx, role=message.get("role"))
+
+    log_chat("chat_history_prepared", total_messages=len(chat_history))
 
     user_message = (
         get_user_audio_message_for_chat_history(request.user_response)
@@ -263,14 +400,17 @@ async def ai_response_for_question(request: AIChatRequest):
             }
         ]
     )
+    log_chat("final_chat_history_built", length=len(chat_history))
 
     # Define an async generator for streaming
     async def stream_response() -> AsyncGenerator[str, None]:
         with tracer.start_as_current_span("ai_chat") as span:
+            log_chat("stream_start")
             # Check if this is a probing session
             probing_session = None
             if hasattr(request, 'probing_session_uuid') and request.probing_session_uuid:
                 probing_session = await get_probing_session(request.probing_session_uuid)
+                log_chat("probing_session_loaded", session_uuid=request.probing_session_uuid, has_session=bool(probing_session))
             
             # Determine session state and modify system prompt accordingly
             session_state = "initial"
@@ -296,6 +436,7 @@ async def ai_response_for_question(request: AIChatRequest):
                             description="The rewritten query/message of the student"
                         )
 
+                    log_chat("query_rewrite_start", model=model)
                     pred = await run_llm_with_instructor(
                         api_key=settings.openai_api_key,
                         model=model,
@@ -303,6 +444,7 @@ async def ai_response_for_question(request: AIChatRequest):
                         response_model=Output,
                         max_completion_tokens=8192,
                     )
+                    log_chat("query_rewrite_done", rewritten_query=pred.rewritten_query[:200])
 
                     chat_history[-2]["content"] = get_user_message_for_chat_history(
                         pred.rewritten_query
@@ -312,8 +454,10 @@ async def ai_response_for_question(request: AIChatRequest):
 
             try:
                 if request.response_type == ChatResponseType.AUDIO:
+                    log_chat("model_selection_audio_start")
                     model = openai_plan_to_model_name["audio"]
                 else:
+                    log_chat("model_routing_start")
                     class Output(BaseModel):
                         use_reasoning_model: bool = Field(
                             description="Whether to use a reasoning model to evaluate the student's response"
@@ -344,22 +488,26 @@ async def ai_response_for_question(request: AIChatRequest):
                             response_model=Output,
                             max_completion_tokens=4096,
                         )
+                    log_chat("model_routing_done", use_reasoning=router_output.use_reasoning_model)
 
                     if router_output.use_reasoning_model:
                         model = openai_plan_to_model_name["reasoning"]
                     else:
                         model = openai_plan_to_model_name["text"]
+                log_chat("model_selected", model=model)
 
                 # print(f"Using model: {model}")
 
                 if request.task_type == TaskType.QUIZ:
+                    log_chat("quiz_branch_entered", question_type=str(question["type"]))
                     if question["type"] == QuestionType.OBJECTIVE:
+                        log_chat("objective_schema_setup")
                         class Output(BaseModel):
                             analysis: str = Field(
-                                description="A detailed analysis of the student's response"
+                                description="Write in first person as a kind, encouraging professor. Provide a detailed analysis of the student's response."
                             )
                             feedback: str = Field(
-                                description="Feedback on the student's response; add newline characters to the feedback to make it more readable where necessary"
+                                description="Write in first person as a kind, encouraging professor. Provide supportive, constructive feedback; add line breaks for readability where helpful."
                             )
                             is_correct: bool = Field(
                                 description="Whether the student's response correctly solves the original task that the student is supposed to solve. For this to be true, the original task needs to be completely solved and not just partially solved. Giving the right answer to one step of the task does not count as solving the entire task."
@@ -392,15 +540,16 @@ async def ai_response_for_question(request: AIChatRequest):
 
                         class Output(BaseModel):
                             feedback: str = Field(
-                                description="A single, comprehensive summary based on the scoring criteria"
+                                description="Write in first person as a kind, encouraging professor. Provide a single, comprehensive summary based on the scoring criteria."
                             )
                             scorecard: Optional[List[Row]] = Field(
                                 description="List of rows with one row for each category from scoring criteria; only include this in the response if the student's response is an answer to the task"
                             )
                 else:
+                    log_chat("learning_material_branch_entered")
                     class Output(BaseModel):
                         response: str = Field(
-                            description="Response to the student's query; add proper formatting to the response to make it more readable where necessary"
+                            description="Write in first person as a kind, encouraging professor. Provide the response to the student's query with clear formatting for readability."
                         )
 
                 parser = PydanticOutputParser(pydantic_object=Output)
@@ -430,11 +579,13 @@ async def ai_response_for_question(request: AIChatRequest):
                         context_instructions = f"""\n\nMake sure to use only the information provided within ``` below for responding to the student while ignoring any other information that contradicts the information provided:\n\n```\n{knowledge_base}\n```"""
 
                     # Ensure a default system prompt is set for QUIZ
-                    system_prompt = f"""{context_instructions}
+                    system_prompt = f"""You are a kind, encouraging professor speaking in first person, guiding the student with clear, constructive feedback. Keep a supportive, empathetic tone while remaining precise and professional.
+
+{context_instructions}
 {format_instructions}"""
 
                     if question["type"] == QuestionType.OBJECTIVE:
-                        system_prompt = f"""You are a Socratic tutor who guides students and tests deep understanding through probing questions.
+                        system_prompt = f"""You are a Socratic tutor who guides students and tests deep understanding through probing questions. Write in first person as a kind, encouraging professor, offering supportive and constructive feedback.
 
 EVALUATION FLOW:
 1. **Initial Assessment**: Check if the student's response is correct
@@ -459,7 +610,7 @@ CERTIFICATION CRITERIA:
 {format_instructions}"""
 
                     elif session_state == "probing":
-                        system_prompt = f"""You are evaluating a student's response to a probing question that tests their understanding.
+                        system_prompt = f"""You are evaluating a student's response to a probing question that tests their understanding. Respond in first person as a kind, encouraging professor.
 
 PREVIOUS CONTEXT:
 - Student correctly answered: {probing_session['initial_correct_answer']}
@@ -481,13 +632,13 @@ CERTIFICATION DECISION:
 {format_instructions}"""
                 else:
                     # Non-quiz: generic system prompt using format instructions
-                    system_prompt = f"""You are a helpful tutor.
+                    system_prompt = f"""You are a kind, encouraging professor speaking in first person, guiding the student with clear, constructive feedback.
 
 {format_instructions}"""
 
                 messages = [{"role": "system", "content": system_prompt}] + chat_history
-
                 # Create streaming response from LLM
+                log_chat("llm_stream_call_start", model=model)
                 with using_attributes(
                     session_id=session_id,
                     user_id=str(request.user_id),
@@ -500,11 +651,16 @@ CERTIFICATION DECISION:
                         response_model=Output,
                         max_completion_tokens=8192,
                     )
+                    log_chat("llm_stream_acquired")
 
                 # Process streaming response
+                chunk_counter = 0
                 async for chunk in stream:
+                    chunk_counter += 1
                     # Default content
                     content = json.dumps(chunk.model_dump()) + "\n"
+                    if chunk_counter <= 5:
+                        log_chat("stream_chunk", idx=chunk_counter, size=len(content))
 
                     # Handle probing logic (objective questions only)
                     if (
@@ -520,6 +676,7 @@ CERTIFICATION DECISION:
                             request.task_id,
                             request.user_response
                         )
+                        log_chat("probing_session_created", session_uuid=session_uuid)
 
                         if getattr(chunk, "probe_me_question", None):
                             await update_probing_session_with_question(
@@ -527,6 +684,7 @@ CERTIFICATION DECISION:
                                 chunk.probe_me_question.question,
                                 chunk.probe_me_question.question_type
                             )
+                            log_chat("probing_question_set", session_uuid=session_uuid, q_type=getattr(chunk.probe_me_question, 'question_type', None))
 
                             # Add session UUID to response
                             chunk_data = chunk.model_dump()
@@ -543,6 +701,7 @@ CERTIFICATION DECISION:
                             chunk.understanding_certification.mastery_level if getattr(chunk, "understanding_certification", None) else None,
                             chunk.understanding_certification.concepts_mastered if getattr(chunk, "understanding_certification", None) else None
                         )
+                        log_chat("probing_response_recorded", session_uuid=probing_session["session_uuid"], certified=getattr(chunk, "understanding_certification", None) and chunk.understanding_certification.certified)
 
                         if getattr(chunk, "understanding_certification", None) and chunk.understanding_certification.certified:
                             # Create certification record
@@ -555,12 +714,13 @@ CERTIFICATION DECISION:
                                 chunk.understanding_certification.concepts_mastered,
                                 1  # probing_attempts
                             )
+                            log_chat("understanding_certification_created", session_uuid=probing_session["session_uuid"], mastery=getattr(chunk.understanding_certification, 'mastery_level', None))
 
                     # Emit content
                     output_buffer.append(content)
                     yield content
-
             except Exception as error:
+                log_chat("stream_exception", error=str(error))
                 span.record_exception(error)
                 span.set_status(Status(StatusCode.ERROR))
                 raise error
@@ -569,6 +729,7 @@ CERTIFICATION DECISION:
                 if hasattr(span, 'set_output'):
                     span.set_output("".join(output_buffer))
                 span.set_status(Status(StatusCode.OK))
+                log_chat("stream_complete", chunks=chunk_counter)
 
     # Return a streaming response
     return StreamingResponse(
